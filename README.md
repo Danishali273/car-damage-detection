@@ -1,4 +1,4 @@
-# Car Damage Detection v2
+# Car Damage Detection
 
 A two-stage computer vision pipeline for detecting car parts and assessing specific types of damage on each part. Built with Python, OpenCV, and Ultralytics YOLO.
 
