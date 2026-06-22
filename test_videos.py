@@ -415,19 +415,19 @@ PART_THRESHOLDS — edit those values to tune each class independently.
 
 Examples:
   # Basic usage — process every frame
-  python video_damage_detection.py car_video.mp4
+  python test_videos.py car_video.mp4
 
   # Process every 3rd frame (faster, lower quality)
-  python video_damage_detection.py car_video.mp4 --frame-skip 3
+  python test_videos.py car_video.mp4 --frame-skip 3
 
   # Custom output path + live preview
-  python video_damage_detection.py car_video.mp4 --output out.mp4 --preview
+  python test_videos.py car_video.mp4 --output out.mp4 --preview
 -skip
   # Lower thresholds for more detections
-  python video_damage_detection.py car_video.mp4 --parts-conf 0.10 --damage-conf 0.10
+  python test_videos.py car_video.mp4 --parts-conf 0.10 --damage-conf 0.10
 
   # Only save the damage video
-  python video_damage_detection.py car_video.mp4 --no-parts
+  python test_videos.py car_video.mp4 --no-parts
         """
     )
     ap.add_argument('video',

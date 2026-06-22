@@ -495,9 +495,9 @@ Per-class thresholds are set inside the script in DAMAGE_THRESHOLDS and
 PART_THRESHOLDS dicts — edit those values to tune each class independently.
 
 Examples:
-  python 1.py car8.jpeg
-  python 1.py car8.jpeg --output out.jpg
-  python 1.py car8.jpeg --parts-conf 0.05 --damage-conf 0.05
+  python test_images.py car8.jpeg
+  python test_images.py car8.jpeg --output out.jpg
+  python test_images.py car8.jpeg --parts-conf 0.05 --damage-conf 0.05
         """
     )
     ap.add_argument('image',

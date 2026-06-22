@@ -7,6 +7,7 @@
 *.tiff
 *.webp
 *.svg
+*.yaml
 
 # Ignore video files
 *.mp4
