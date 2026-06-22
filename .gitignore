@@ -1,27 +1,18 @@
-# Ignore everything by default
-*
+# Ignore image files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.svg
 
-# Allow directories so git can traverse into them
-!*/
-
-# Allow Python files
-!*.py
-
-# Allow common ML/AI model files
-!*.h5
-!*.keras
-!*.pt
-!*.pth
-!*.onnx
-!*.pkl
-!*.joblib
-!*.tflite
-!*.pb
-!*.weights
-!*.bin
-!*.ckpt
-!*.index
-!*.meta
-
-# Allow this .gitignore file itself to be tracked
-!.gitignore
+# Ignore video files
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wmv
+*.flv
+*.webm
