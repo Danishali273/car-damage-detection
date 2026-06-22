@@ -5,7 +5,7 @@ A two-stage computer vision pipeline for detecting car parts and assessing speci
 ## Overview
 
 This project uses two YOLO models to perform sequential detection:
-1. **Stage 1 (Part Detection):** Identifies specific car parts in total 18 classes (e.g., Hood, Bumper, Windshield, Wheels, etc...) using `best_car_part.pt`.
+1. **Stage 1 (Part Detection):** Identifies specific car parts in total 21 classes (e.g., Hood, Bumper, Windshield, Wheels, etc...) using `best_car_part.pt`.
 2. **Stage 2 (Damage Detection):** Analyzes the cropped region of each detected part to find specific damages in total 7 classes (e.g., Dent, Scratch, Smash, Glass Break, etc...) using `best_damage_type.pt`.
 
 The system intelligently maps specific damages to relevant parts (e.g., a "flat tire" can only occur on a wheel, and a "glass break" can only occur on windows). 
