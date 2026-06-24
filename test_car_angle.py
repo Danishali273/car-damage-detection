@@ -25,7 +25,7 @@ model = YOLO('models/best_car_angle.pt')
 
 # 3. Run prediction
 results = model.predict(
-    source='testvideo2.mp4', 
+    source='testvideo.mp4', 
     save=True,      
     show=False,     
     conf=0.5,

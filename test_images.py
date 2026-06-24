@@ -40,13 +40,13 @@ damage_model = YOLO('models/best_damage_type.pt')
 # Tune these independently for each damage type.
 # A detection is only accepted if its confidence >= the threshold set here.
 DAMAGE_THRESHOLDS = {
-    'dent':         0.50,
-    'glass_break':  0.80,
-    'scratch':      0.50,
+    'dent':         0.40,
+    'glass_break':  0.40,
+    'scratch':      0.40,
     'smash':        0.80,
-    'crack':        0.50,
-    'broken_light': 0.50,
-    'flat_tire':    0.90,
+    'crack':        0.40,
+    'broken_light': 0.40,
+    'flat_tire':    0.80,
 }
 
 PART_THRESHOLDS = {
