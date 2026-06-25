@@ -8,6 +8,7 @@
 *.webp
 *.svg
 *.yaml
+*.json
 
 # Ignore video files
 *.mp4
