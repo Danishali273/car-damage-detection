@@ -14,12 +14,6 @@ Key architectural features
   • Voting / Threshold logic — suppresses single-frame noise ("flickering")
   • Hierarchical Damage Localisation — "Part + Direction" compound labels
   • Flicker Suppression — direction uncertainty is smoothed with a rolling buffer
-
-Usage
------
-  python pipeline.py testvideo2.mp4
-  python pipeline.py testvideo2.mp4 --output out.mp4 --frame-skip 2 --preview
-  python pipeline.py testvideo2.mp4 --report report.json
 """
 
 from __future__ import annotations
@@ -33,7 +27,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -164,12 +158,24 @@ PART_DAMAGE_MAP: Dict[str, List[str]] = {
 _BODY_PANEL_DEFAULT = ["dent", "scratch", "smash", "crack"]
 
 # ── DamageRegistry voting parameters ─────────────────────────────────────────
-# Lowered defaults — 2 votes + 15 % ratio works well for short walkaround clips.
+# Lowered defaults — 3 votes + 25 % ratio works well for short walkaround clips.
 # Raise these values to reduce false positives on longer recordings.
 REGISTRY_MIN_VOTES      = 3    # minimum frames a damage must appear to be "confirmed"
-REGISTRY_MIN_VOTE_RATIO = 0.25  # damage seen in >= 15 % of frames it was observable
+REGISTRY_MIN_VOTE_RATIO = 0.25  # damage seen in >= 25 % of frames it was observable
 DIRECTION_BUFFER_LEN    = 5    # rolling window for direction flicker suppression
 DIRECTION_CONF_THRESHOLD = 0.60  # minimum classifier confidence to accept a direction
+
+# ── Overlapping direction groups (for cross-view deduplication) ───────────────
+# Directions within the same group share physical overlap, so the same scratch
+# on a fender can appear in both "front-right-side" and "right-side" views.
+# deduplicate_report() uses this table to keep only the highest-confidence
+# entry when the same (part, damage_type) is detected from two overlapping angles.
+DIRECTION_OVERLAP_GROUPS: List[Set[str]] = [
+    {"front-right-side", "right-side", "front"},
+    {"front-left-side",  "left-side",  "front"},
+    {"back-right-side",  "right-side",  "back"},
+    {"back-left-side",   "left-side",   "back"},
+]
 
 # ── Visual / HUD colours ──────────────────────────────────────────────────────
 PALETTE = [
@@ -392,7 +398,7 @@ class PartRecord:
     Fields
     ------
     observations       : all raw per-frame damage observations
-    total_frames_seen  : how many frames this part was detected in *from this direction*
+    _seen_frames       : set of unique frame indices where this part was visible
     confirmed_damages  : dict mapping damage_type → best confidence
                          (populated after finalize() is called)
     """
@@ -400,15 +406,22 @@ class PartRecord:
     track_id:           int
     car_direction:      str
     observations:       List[DamageObservation] = field(default_factory=list)
-    total_frames_seen:  int = 0
+    _seen_frames:       Set[int] = field(default_factory=set)
     confirmed_damages:  Dict[str, float] = field(default_factory=dict)
 
+    @property
+    def total_frames_seen(self) -> int:
+        """Number of unique frames in which this part was detected."""
+        return len(self._seen_frames)
+
+    def mark_seen(self, frame_index: int) -> None:
+        """Record that this part was visible on a given frame."""
+        self._seen_frames.add(frame_index)
+
     def add_observation(self, obs: DamageObservation) -> None:
-        # NOTE: do NOT increment total_frames_seen here.
-        # mark_part_seen() is always called first (even on frames with no damage),
-        # so the counter is already correct.  Incrementing again here would
-        # double-count damaged frames and artificially halve the vote ratio.
+        """Record a damage observation and track its frame."""
         self.observations.append(obs)
+        self._seen_frames.add(obs.frame_index)
 
     def finalize(
         self,
@@ -512,20 +525,24 @@ class DamageRegistry:
         track_id:      int,
         part_name:     str,
         car_direction: str,
+        frame_index:   int,
     ) -> None:
         """
-        Increment the 'frames seen' counter for a (part, direction) pair even
-        when no damage is detected on that frame.  This keeps the min_ratio
-        denominator accurate per directional view, preventing a low-observation
-        direction from incorrectly boosting or diluting the vote ratio of
-        another direction for the same part name.
+        Track that a part was visible on a given frame, even when no damage
+        is detected on that frame.  This keeps the min_ratio denominator
+        accurate per directional view, preventing a low-observation direction
+        from incorrectly boosting or diluting the vote ratio of another
+        direction for the same part name.
+
+        Frame duplication is handled via a set — calling this multiple times
+        with the same frame_index is safe and idempotent.
         """
         key = (track_id, part_name, car_direction)
         if key not in self._records:
             self._records[key] = PartRecord(
                 part_name=part_name, track_id=track_id, car_direction=car_direction
             )
-        self._records[key].total_frames_seen += 1
+        self._records[key].mark_seen(frame_index)
 
     # ------------------------------------------------------------------
     def finalize(self) -> List[Dict]:
@@ -664,7 +681,62 @@ class DamageRegistry:
         return "\n".join(lines)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7.  MODEL WRAPPERS
+# 7.  CROSS-VIEW DEDUPLICATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _directions_overlap(d1: str, d2: str) -> bool:
+    """Return True if d1 and d2 belong to the same physical overlap group."""
+    for group in DIRECTION_OVERLAP_GROUPS:
+        if d1 in group and d2 in group:
+            return True
+    return False
+
+
+def deduplicate_report(report: List[Dict]) -> List[Dict]:
+    """
+    Remove duplicate damage entries caused by overlapping camera angles.
+
+    Problem
+    -------
+    A scratch on a fender photographed from a "right-side" angle and again
+    from a "front-right-side" angle produces two separate registry entries
+    (because the registry key includes ``car_direction``) even though they
+    describe the same physical damage.
+
+    Strategy
+    --------
+    For every pair of entries that share the same ``part_name`` and
+    ``damage_type`` *and* whose directions belong to the same overlap group
+    (see ``DIRECTION_OVERLAP_GROUPS``), keep only the entry with the higher
+    confidence score.
+
+    Returns
+    -------
+    Deduplicated list of report dicts, preserving the original order for
+    entries that are not merged.
+    """
+    kept: List[Dict] = []
+    for item in report:
+        merged = False
+        for existing in kept:
+            if (
+                existing["part_name"]   == item["part_name"]
+                and existing["damage_type"] == item["damage_type"]
+                and _directions_overlap(existing["car_direction"], item["car_direction"])
+            ):
+                # Same physical damage from an overlapping angle — keep the
+                # higher-confidence observation and discard the other.
+                if item["confidence"] > existing["confidence"]:
+                    existing.update(item)
+                merged = True
+                break
+        if not merged:
+            kept.append(dict(item))   # shallow copy to avoid mutating the original
+    return kept
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8.  MODEL WRAPPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DirectionClassifier:
@@ -957,7 +1029,7 @@ class CarDamagePipeline:
             # Mark that this part was visible (for ratio denominator).
             # stable_dir is passed so the counter is tracked per (part, direction)
             # key — keeping the vote denominator accurate for each directional view.
-            self.registry.mark_part_seen(track_id, part_name, stable_dir)
+            self.registry.mark_part_seen(track_id, part_name, stable_dir, frame_index)
 
             # Draw segmentation on parts frame
             if mask_pts is not None and mask_pts.size > 0:
@@ -1215,7 +1287,7 @@ def run_video(
     # Call finalize() exactly once so that PartRecord.confirmed_damages is
     # written only once.  Both the console summary and the optional JSON file
     # share the same pre-computed result — no redundant re-voting.
-    report = pipeline.registry.finalize()
+    report = deduplicate_report(pipeline.registry.finalize())
     print(DamageRegistry.format_report(report))
 
     if report_path:
@@ -1296,7 +1368,7 @@ def run_image(
     if debug:
         print(pipeline.registry.debug_registry())
 
-    report = pipeline.registry.finalize()
+    report = deduplicate_report(pipeline.registry.finalize())
     print(DamageRegistry.format_report(report))
 
     # ── Save annotated output images ──────────────────────────────────────────
