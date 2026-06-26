@@ -108,9 +108,9 @@ CAR_PARTS_MAP: Dict[str, List[str]] = {
 # ── Per-class damage thresholds ───────────────────────────────────────────────
 DAMAGE_THRESHOLDS: Dict[str, float] = {
     "dent":         0.50,
-    "glass_break":  0.70,
+    "glass_break":  0.50,
     "scratch":      0.50,
-    "smash":        0.80,
+    "smash":        0.70,
     "crack":        0.50,
     "broken_light": 0.50,
     "flat_tire":    0.80,
@@ -137,20 +137,20 @@ PART_DAMAGE_MAP: Dict[str, List[str]] = {
     "Back-wheel":      ["flat_tire"],
     "Front-wheel":     ["flat_tire"],
     # Glass surfaces
-    "Back-window":     ["glass_break", "crack"],
-    "Back-windshield": ["glass_break", "crack"],
-    "Front-window":    ["glass_break", "crack"],
-    "Windshield":      ["glass_break", "crack"],
+    "Back-window":     ["glass_break"],
+    "Back-windshield": ["glass_break"],
+    "Front-window":    ["glass_break"],
+    "Windshield":      ["glass_break"],
     # Lights
-    "Headlight":       ["broken_light", "crack", "scratch"],
-    "Tail-light":      ["broken_light", "crack", "scratch"],
+    "Headlight":       ["broken_light"],
+    "Tail-light":      ["broken_light"],
     # Small exterior parts
     "Mirror":          ["crack", "scratch"],
-    "Grille":          ["crack", "scratch"],
-    "License-plate":   ["dent", "scratch", "smash"],
+    "Grille":          ["crack"],
+    "License-plate":   ["dent", "scratch"],
     # Bumpers
-    "Front-bumper":    ["dent", "smash", "scratch", "crack"],
-    "Back-bumper":     ["dent", "smash", "scratch", "crack"],
+    "Front-bumper":    ["dent", "scratch", "crack"],
+    "Back-bumper":     ["dent", "scratch", "crack"],
     # Body panels
     "Hood":            ["dent", "scratch", "smash", "crack"],
     "Trunk":           ["dent", "scratch", "smash", "crack"],
@@ -167,7 +167,7 @@ _BODY_PANEL_DEFAULT = ["dent", "scratch", "smash", "crack"]
 # Lowered defaults — 2 votes + 15 % ratio works well for short walkaround clips.
 # Raise these values to reduce false positives on longer recordings.
 REGISTRY_MIN_VOTES      = 3    # minimum frames a damage must appear to be "confirmed"
-REGISTRY_MIN_VOTE_RATIO = 0.30  # damage seen in >= 30 % of frames it was observable
+REGISTRY_MIN_VOTE_RATIO = 0.20  # damage seen in >= 15 % of frames it was observable
 DIRECTION_BUFFER_LEN    = 5    # rolling window for direction flicker suppression
 DIRECTION_CONF_THRESHOLD = 0.60  # minimum classifier confidence to accept a direction
 
