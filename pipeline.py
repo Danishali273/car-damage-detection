@@ -113,7 +113,7 @@ DAMAGE_THRESHOLDS: Dict[str, float] = {
     "smash":        0.70,
     "crack":        0.50,
     "broken_light": 0.50,
-    "flat_tire":    0.80,
+    "flat_tire":    0.90,
 }
 
 # ── Per-part segmentation thresholds ─────────────────────────────────────────
@@ -167,7 +167,7 @@ _BODY_PANEL_DEFAULT = ["dent", "scratch", "smash", "crack"]
 # Lowered defaults — 2 votes + 15 % ratio works well for short walkaround clips.
 # Raise these values to reduce false positives on longer recordings.
 REGISTRY_MIN_VOTES      = 3    # minimum frames a damage must appear to be "confirmed"
-REGISTRY_MIN_VOTE_RATIO = 0.20  # damage seen in >= 15 % of frames it was observable
+REGISTRY_MIN_VOTE_RATIO = 0.25  # damage seen in >= 15 % of frames it was observable
 DIRECTION_BUFFER_LEN    = 5    # rolling window for direction flicker suppression
 DIRECTION_CONF_THRESHOLD = 0.60  # minimum classifier confidence to accept a direction
 
@@ -179,6 +179,9 @@ PALETTE = [
     (170, 110,  40), (255, 250, 200), (128,  0,   0), (170, 255, 195),
     (128, 128,   0), (255, 215, 180), (0,   0, 128), (128, 128, 128),
 ]
+
+# ── Supported image extensions (auto-detected in CLI) ────────────────────────
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1227,57 +1230,176 @@ def run_video(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 10.  CLI
+# 10.  IMAGE RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_image(
+    image_path:        str,
+    output_path:       str   = "result_pipeline.jpg",
+    parts_conf:        float = 0.30,
+    damage_conf:       float = 0.30,
+    report_path:       Optional[str] = None,
+    debug:             bool  = False,
+) -> None:
+    """
+    Single-image inference mode.
+
+    Key differences from run_video
+    -------------------------------
+    • No VideoCapture loop — the image is treated as a single frame.
+    • DirectionBuffer still runs but receives exactly one observation;
+      because maxlen=5 and the buffer is pre-warmed after the first
+      high-conf update, stable_dir is set immediately.
+    • DamageRegistry is created with min_votes=1 and min_ratio=0.0 so
+      that a single-frame detection counts as "confirmed" — temporal
+      voting only makes sense across multiple frames.
+    • Output is two annotated images (_parts / _damage) instead of videos.
+    """
+    log.info("=" * 65)
+    log.info("Car Damage Detection — Image Mode")
+    log.info("Input  : %s", image_path)
+    log.info("Output : %s", output_path)
+    log.info("=" * 65)
+
+    frame = cv2.imread(image_path)
+    if frame is None:
+        raise RuntimeError(
+            f"Cannot load image: {image_path}\n"
+            "Check the path is correct and the file is a supported format "
+            f"({', '.join(sorted(IMAGE_EXTENSIONS))})."
+        )
+
+    h, w = frame.shape[:2]
+    log.info("Resolution : %dx%d", w, h)
+
+    # For a single image bypass temporal voting — every detection is
+    # immediately confirmed (min_votes=1, min_ratio=0.0).
+    pipeline = CarDamagePipeline(
+        parts_conf_floor=parts_conf,
+        damage_conf_floor=damage_conf,
+        min_votes=1,
+        min_ratio=0.0,
+    )
+
+    parts_frm, damage_frm, stable_dir = pipeline.process_frame(
+        frame, frame_index=1, track_id=0
+    )
+
+    if stable_dir is None:
+        log.warning(
+            "Direction classifier returned no stable direction on this image.\n"
+            "The output frames may be unannotated.  Try a clearer, well-lit photo."
+        )
+    else:
+        log.info("Detected direction : %s", stable_dir)
+
+    if debug:
+        print(pipeline.registry.debug_registry())
+
+    report = pipeline.registry.finalize()
+    print(DamageRegistry.format_report(report))
+
+    # ── Save annotated output images ──────────────────────────────────────────
+    base = os.path.splitext(output_path)[0]
+    ext  = os.path.splitext(output_path)[1] or ".jpg"
+
+    parts_out  = f"{base}_parts{ext}"
+    damage_out = f"{base}_damage{ext}"
+
+    cv2.imwrite(parts_out,  parts_frm)
+    cv2.imwrite(damage_out, damage_frm)
+    log.info("Parts image  → %s", parts_out)
+    log.info("Damage image → %s", damage_out)
+
+    if report_path:
+        Path(report_path).write_text(json.dumps(report, indent=2))
+        log.info("Report saved → %s", report_path)
+
+    log.info("Done.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 11.  CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Integrated 3-Model Car Damage Pipeline",
+        description="Integrated 3-Model Car Damage Pipeline (video & image)",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
-Examples:
+Examples — Video:
   python pipeline.py testvideo2.mp4
   python pipeline.py testvideo2.mp4 --frame-skip 2 --preview
   python pipeline.py testvideo2.mp4 --report report.json
   python pipeline.py testvideo2.mp4 --min-votes 5 --min-ratio 0.4
+
+Examples — Image:
+  python pipeline.py car.jpg
+  python pipeline.py car.png --output result.jpg --report report.json
+  python pipeline.py car.jpg --parts-conf 0.25 --damage-conf 0.25 --debug
         """,
     )
-    ap.add_argument("video", help="Input video file")
-    ap.add_argument("--output",      default="result_pipeline.mp4",
-                    help="Base output path (default: result_pipeline.mp4)")
+    ap.add_argument("input",
+                    help="Input file — video (mp4/avi/…) or image (jpg/png/bmp/…).\n"
+                         "Mode is auto-detected from the file extension.")
+    ap.add_argument("--output",      default="result_pipeline",
+                    help="Base output path without extension (default: result_pipeline).\n"
+                         "Extensions are added automatically (_parts.mp4 / _parts.jpg etc.).")
     ap.add_argument("--parts-conf",  type=float, default=0.30,
                     help="Parts segmentation conf floor (default: 0.30)")
     ap.add_argument("--damage-conf", type=float, default=0.30,
                     help="Damage detection conf floor (default: 0.30)")
+    # ── Video-only flags ───────────────────────────────────────────────────────
     ap.add_argument("--frame-skip",  type=int, default=1,
-                    help="Process every Nth frame (default: 1)")
+                    help="[Video only] Process every Nth frame (default: 1)")
     ap.add_argument("--preview",     action="store_true",
-                    help="Show live preview windows (press q to stop)")
+                    help="[Video only] Show live preview windows (press q to stop)")
     ap.add_argument("--no-parts",    action="store_true",
-                    help="Skip parts output video")
+                    help="[Video only] Skip parts output video")
     ap.add_argument("--no-damage",   action="store_true",
-                    help="Skip damage output video")
+                    help="[Video only] Skip damage output video")
+    ap.add_argument("--min-votes",   type=int, default=REGISTRY_MIN_VOTES,
+                    help=f"[Video only] Min frames to confirm damage (default: {REGISTRY_MIN_VOTES})")
+    ap.add_argument("--min-ratio",   type=float, default=REGISTRY_MIN_VOTE_RATIO,
+                    help=f"[Video only] Min frame ratio to confirm damage (default: {REGISTRY_MIN_VOTE_RATIO})")
+    # ── Shared flags ───────────────────────────────────────────────────────────
     ap.add_argument("--report",      default=None,
                     help="Optional path to save JSON damage report")
-    ap.add_argument("--min-votes",   type=int, default=REGISTRY_MIN_VOTES,
-                    help=f"Min frames to confirm damage (default: {REGISTRY_MIN_VOTES})")
-    ap.add_argument("--min-ratio",   type=float, default=REGISTRY_MIN_VOTE_RATIO,
-                    help=f"Min frame ratio to confirm damage (default: {REGISTRY_MIN_VOTE_RATIO})")
     ap.add_argument("--debug",       action="store_true",
                     help="Print raw vote counts from registry before final report")
     args = ap.parse_args()
 
-    run_video(
-        video_path   = args.video,
-        output_path  = args.output,
-        parts_conf   = args.parts_conf,
-        damage_conf  = args.damage_conf,
-        frame_skip   = args.frame_skip,
-        preview      = args.preview,
-        save_parts   = not args.no_parts,
-        save_damage  = not args.no_damage,
-        report_path  = args.report,
-        min_votes    = args.min_votes,
-        min_ratio    = args.min_ratio,
-        debug        = args.debug,
-    )
+    _ext = Path(args.input).suffix.lower()
+    if _ext in IMAGE_EXTENSIONS:
+        # ── Image mode ────────────────────────────────────────────────────────
+        # Default output keeps the same extension as the input image.
+        _out = args.output
+        if not Path(_out).suffix:
+            _out = _out + _ext          # e.g. "result_pipeline" → "result_pipeline.jpg"
+        run_image(
+            image_path  = args.input,
+            output_path = _out,
+            parts_conf  = args.parts_conf,
+            damage_conf = args.damage_conf,
+            report_path = args.report,
+            debug       = args.debug,
+        )
+    else:
+        # ── Video mode ────────────────────────────────────────────────────────
+        _out = args.output
+        if not Path(_out).suffix:
+            _out = _out + ".mp4"        # e.g. "result_pipeline" → "result_pipeline.mp4"
+        run_video(
+            video_path  = args.input,
+            output_path = _out,
+            parts_conf  = args.parts_conf,
+            damage_conf = args.damage_conf,
+            frame_skip  = args.frame_skip,
+            preview     = args.preview,
+            save_parts  = not args.no_parts,
+            save_damage = not args.no_damage,
+            report_path = args.report,
+            min_votes   = args.min_votes,
+            min_ratio   = args.min_ratio,
+            debug       = args.debug,
+        )
