@@ -104,7 +104,7 @@ DAMAGE_THRESHOLDS: Dict[str, float] = {
     "dent":         0.50,
     "glass_break":  0.50,
     "scratch":      0.50,
-    "smash":        0.70,
+    "smash":        0.90,
     "crack":        0.50,
     "broken_light": 0.50,
     "flat_tire":    0.90,
@@ -161,14 +161,21 @@ _BODY_PANEL_DEFAULT = ["dent", "scratch", "smash", "crack"]
 # Lowered defaults — 3 votes + 25 % ratio works well for short walkaround clips.
 # Raise these values to reduce false positives on longer recordings.
 REGISTRY_MIN_VOTES      = 3    # minimum frames a damage must appear to be "confirmed"
-REGISTRY_MIN_VOTE_RATIO = 0.25  # damage seen in >= 25 % of frames it was observable
-DIRECTION_BUFFER_LEN    = 5    # rolling window for direction flicker suppression
+REGISTRY_MIN_VOTE_RATIO = 0.20  # damage seen in >= 15 % of frames it was observable
+DIRECTION_BUFFER_LEN    = 3    # consecutive high-conf frames needed to commit to a new direction
 DIRECTION_CONF_THRESHOLD = 0.60  # minimum classifier confidence to accept a direction
+
+# ── Spatial instance-tracking parameters ─────────────────────────────────────
+# Two damage detections of the same type on the same part are treated as the
+# *same physical instance* when their normalised centroids (relative to the
+# part crop) are closer than INSTANCE_MATCH_RADIUS.  Increase this value to
+# merge nearby detections more aggressively; decrease it to split them sooner.
+INSTANCE_MATCH_RADIUS = 0.30   # fraction of crop diagonal
 
 # ── Overlapping direction groups (for cross-view deduplication) ───────────────
 # Directions within the same group share physical overlap, so the same scratch
 # on a fender can appear in both "front-right-side" and "right-side" views.
-# deduplicate_report() uses this table to keep only the highest-confidence
+# deduplicate_report() uses this table to keep only the highest-confidence      
 # entry when the same (part, damage_type) is detected from two overlapping angles.
 DIRECTION_OVERLAP_GROUPS: List[Set[str]] = [
     {"front-right-side", "right-side", "front"},
@@ -176,6 +183,14 @@ DIRECTION_OVERLAP_GROUPS: List[Set[str]] = [
     {"back-right-side",  "right-side",  "back"},
     {"back-left-side",   "left-side",   "back"},
 ]
+
+# ── Corner parts — direction-aware deduplication ─────────────────────────────
+# These parts wrap around a corner of the car (e.g., the front-left and
+# front-right corners of the front bumper are physically distinct locations).
+# Damage on a corner part is NEVER merged across directions; every direction
+# produces its own separate entry in the final report.
+CORNER_PARTS: Set[str] = {"Front-bumper", "Back-bumper"}
+
 
 # ── Visual / HUD colours ──────────────────────────────────────────────────────
 PALETTE = [
@@ -253,40 +268,45 @@ class PerspectiveTransformer:
 
 class DirectionBuffer:
     """
-    Smooths rapid direction changes caused by:
-      - The car rotating during a walkaround
-      - Low-confidence classification frames
-      - Motion blur degrading the angle classifier
+    Detects genuine direction transitions while suppressing single-frame flicker.
 
-    Strategy
-    --------
-    Maintains a rolling window of the last N car-centric direction labels.
-    The *mode* (most frequent label) over the window is used as the current
-    stable direction.  A frame is only accepted into the buffer when the
-    classifier's top-1 confidence is above DIRECTION_CONF_THRESHOLD.
+    Strategy — streak-based commit
+    --------------------------------
+    A new direction is *committed* (accepted as the stable direction) only when
+    it appears in ``streak_needed`` **consecutive** high-confidence frames.
+    A single anomalous frame is therefore ignored, but a real camera-angle
+    transition (which lasts many frames) is detected quickly.
 
-    If the classifier is uncertain (conf < threshold), the previous stable
-    direction is reused — this is the "flicker suppression" mechanism.
+    This replaces the previous mode-vote approach, which required a direction
+    to be the *most frequent* label over a rolling window.  The mode approach
+    failed on walkaround videos where "front" frames in the middle of the clip
+    dominated the window and swamped the flanking "front-left-side" /
+    "front-right-side" transitions.
 
     Low-confidence fallback
     -----------------------
-    If confidence has been below the threshold for `max_low_conf_streak`
-    consecutive frames (default: 10), the raw direction label is accepted
-    regardless — preventing the pipeline from silently producing no output
-    on low-quality or heavily compressed footage.
+    If confidence has been below the threshold for ``max_low_conf_streak``
+    consecutive frames, the raw direction label is accepted regardless —
+    preventing the pipeline from silently producing no output on low-quality
+    or heavily compressed footage.
     """
 
     def __init__(
         self,
-        window: int = DIRECTION_BUFFER_LEN,
-        conf_min: float = DIRECTION_CONF_THRESHOLD,
+        streak_needed: int   = DIRECTION_BUFFER_LEN,
+        conf_min: float      = DIRECTION_CONF_THRESHOLD,
         max_low_conf_streak: int = 10,
     ) -> None:
-        self._buf: deque[str] = deque(maxlen=window)
-        self._conf_min = conf_min
-        self._max_streak = max_low_conf_streak
+        self._streak_needed   = streak_needed
+        self._conf_min        = conf_min
+        self._max_low_conf    = max_low_conf_streak
+        # Current pending direction and how many consecutive frames it has held
+        self._pending: Optional[str] = None
+        self._pending_streak: int    = 0
+        # The last committed (stable) direction
+        self._committed: Optional[str] = None
+        # Low-confidence fallback counter
         self._low_conf_streak: int = 0
-        self._last_stable: Optional[str] = None
 
     def update(self, direction: str, conf: float) -> Optional[str]:
         """
@@ -299,41 +319,51 @@ class DirectionBuffer:
 
         Returns
         -------
-        Stable direction string, or None if the buffer is still warming up
-        and no stable direction has been seen yet.
+        Stable direction string, or None if no direction has been committed yet.
         """
         if conf >= self._conf_min:
-            # High-confidence frame → accept it and reset the low-conf streak.
-            self._buf.append(direction)
             self._low_conf_streak = 0
+
+            if direction == self._pending:
+                # Same direction as the candidate — extend the streak
+                self._pending_streak += 1
+            else:
+                # New candidate — start fresh streak
+                self._pending        = direction
+                self._pending_streak = 1
+
+            if self._pending_streak >= self._streak_needed:
+                # Streak long enough — commit
+                if direction != self._committed:
+                    log.debug(
+                        "DirectionBuffer: transition %s → %s (streak=%d)",
+                        self._committed, direction, self._pending_streak,
+                    )
+                self._committed      = direction
+                # Reset streak so it doesn't re-log on every subsequent frame
+                self._pending_streak = 0
+
         else:
+            # Low-confidence frame — hold current committed direction
             self._low_conf_streak += 1
-            if self._low_conf_streak >= self._max_streak:
-                # Too many consecutive low-confidence frames — accept the raw
-                # direction as a fallback so the pipeline doesn't silently
-                # skip an entire low-quality video segment.
+            if self._low_conf_streak >= self._max_low_conf:
+                # Too many consecutive uncertain frames — accept raw as fallback
                 log.warning(
                     "DirectionBuffer: %d consecutive low-conf frames "
                     "(conf<%.2f); accepting '%s' as fallback.",
                     self._low_conf_streak, self._conf_min, direction,
                 )
-                self._buf.append(direction)
+                self._committed       = direction
+                self._pending         = direction
+                self._pending_streak  = 0
                 self._low_conf_streak = 0
-            # else: skip this frame, keep the window unchanged
-            #       (equivalent to "holding the last known good direction")
+            # else: keep _committed unchanged (flicker suppression)
 
-        if self._buf:
-            # Mode vote over the rolling window
-            counts: Dict[str, int] = defaultdict(int)
-            for d in self._buf:
-                counts[d] += 1
-            self._last_stable = max(counts, key=counts.__getitem__)
-
-        return self._last_stable
+        return self._committed
 
     @property
     def stable_direction(self) -> Optional[str]:
-        return self._last_stable
+        return self._committed
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -379,9 +409,68 @@ class DamageObservation:
     """A single per-frame observation of a damage event on a part."""
     damage_type:  str
     confidence:   float
-    location:     str        # e.g. "Front-Left-Side Front-Door"
+    location:     str              # e.g. "Front-Left-Side Front-Door"
     car_direction: str
     frame_index:  int
+    # Crop-relative bounding box of the individual damage detection.
+    # Used by PartRecord to cluster spatially-distinct instances of the
+    # same damage type (e.g. two separate scratches on one bumper).
+    damage_bbox:  Tuple[int, int, int, int] = field(default_factory=lambda: (0, 0, 0, 0))
+
+
+@dataclass
+class DamageInstance:
+    """
+    A single spatial cluster of one damage type on a part.
+
+    Multiple per-frame detections of the same ``damage_type`` that land
+    within ``INSTANCE_MATCH_RADIUS`` of each other (normalised centroid
+    distance, relative to the part crop) are accumulated here.  Each
+    instance has its own independent vote counter so that two physically
+    separate scratches on the same bumper produce two confirmed entries.
+
+    Fields
+    ------
+    damage_type    : e.g. "scratch"
+    vote_count     : number of frames this instance was observed
+    best_conf      : highest confidence seen across all observations
+    cx_norm, cy_norm : running mean of the normalised centroid
+                       (updated incrementally; never stored as history)
+    frames_seen    : set of frame indices (prevents double-counting)
+    location       : human-readable compound label (most-voted)
+    """
+    damage_type: str
+    vote_count:  int = 0
+    best_conf:   float = 0.0
+    cx_norm:     float = 0.0   # running mean, normalised to [0, 1]
+    cy_norm:     float = 0.0
+    frames_seen: Set[int] = field(default_factory=set)
+    _loc_votes:  Dict[str, int] = field(default_factory=dict)
+
+    def update(self, conf: float, cx: float, cy: float,
+               frame_index: int, location: str) -> None:
+        """Absorb a new observation into this instance."""
+        if frame_index in self.frames_seen:
+            # Already counted this frame — only update confidence if higher
+            if conf > self.best_conf:
+                self.best_conf = conf
+            return
+        self.frames_seen.add(frame_index)
+        self.vote_count += 1
+        if conf > self.best_conf:
+            self.best_conf = conf
+        # Incremental mean update for the centroid
+        n = self.vote_count
+        self.cx_norm += (cx - self.cx_norm) / n
+        self.cy_norm += (cy - self.cy_norm) / n
+        self._loc_votes[location] = self._loc_votes.get(location, 0) + 1
+
+    @property
+    def best_location(self) -> str:
+        """Most-voted human-readable location label for this instance."""
+        if not self._loc_votes:
+            return ""
+        return max(self._loc_votes, key=self._loc_votes.__getitem__)
 
 
 @dataclass
@@ -392,22 +481,26 @@ class PartRecord:
     Using car_direction as part of the key ensures that a physically large part
     (e.g. "Front-bumper", "Front-door") observed from two distinct car-centric
     directions (e.g. "front" vs "front-left-side") is treated as a separate
-    entity in the registry.  This prevents the old winner-takes-all overwrite
-    that occurred when all views of the same part were collapsed into one record.
+    entity in the registry.
+
+    Spatial instance tracking
+    -------------------------
+    Damage detections of the same type are grouped into ``DamageInstance``
+    clusters based on normalised crop-centroid proximity.  Each cluster has
+    its own independent vote counter, so two separate scratches on the same
+    bumper produce two confirmed entries instead of one.
 
     Fields
     ------
-    observations       : all raw per-frame damage observations
-    _seen_frames       : set of unique frame indices where this part was visible
-    confirmed_damages  : dict mapping damage_type → best confidence
-                         (populated after finalize() is called)
+    instances     : damage_type → list of spatial clusters (DamageInstance)
+    _seen_frames  : set of unique frame indices where this part was visible
     """
-    part_name:          str
-    track_id:           int
-    car_direction:      str
-    observations:       List[DamageObservation] = field(default_factory=list)
-    _seen_frames:       Set[int] = field(default_factory=set)
-    confirmed_damages:  Dict[str, float] = field(default_factory=dict)
+    part_name:     str
+    track_id:      int
+    car_direction: str
+    # damage_type → list of DamageInstance clusters
+    instances:    Dict[str, List[DamageInstance]] = field(default_factory=dict)
+    _seen_frames: Set[int] = field(default_factory=set)
 
     @property
     def total_frames_seen(self) -> int:
@@ -418,41 +511,75 @@ class PartRecord:
         """Record that this part was visible on a given frame."""
         self._seen_frames.add(frame_index)
 
-    def add_observation(self, obs: DamageObservation) -> None:
-        """Record a damage observation and track its frame."""
-        self.observations.append(obs)
-        self._seen_frames.add(obs.frame_index)
-
-    def finalize(
+    def add_instance_observation(
         self,
-        min_votes: int = REGISTRY_MIN_VOTES,
-        min_ratio: float = REGISTRY_MIN_VOTE_RATIO,
+        obs: DamageObservation,
+        crop_w: int,
+        crop_h: int,
+        match_radius: float = INSTANCE_MATCH_RADIUS,
     ) -> None:
         """
-        Apply voting logic to determine which damage types are truly present.
+        Assign the observation to an existing spatial instance or create a new one.
 
-        A damage type is "confirmed" if:
-          1. It was observed in at least `min_votes` frames, AND
-          2. It appeared in at least `min_ratio` fraction of total frames seen.
+        The normalised centroid of the damage bbox (relative to the part crop)
+        is compared against existing instances of the same damage type.  If the
+        distance is below ``match_radius`` (as a fraction of the crop diagonal),
+        the observation is merged into that instance; otherwise a new instance
+        is started.
 
-        This dual requirement prevents both:
-          - Single-frame false positives (min_votes guard)
-          - Detections on parts that appeared briefly (min_ratio guard)
+        Parameters
+        ----------
+        obs         : the damage observation to record
+        crop_w/h    : width and height of the part crop (used for normalisation)
+        match_radius: maximum normalised centroid distance to merge instances
         """
-        vote_counts: Dict[str, int] = defaultdict(int)
-        best_conf:   Dict[str, float] = defaultdict(float)
+        self._seen_frames.add(obs.frame_index)
 
-        for obs in self.observations:
-            vote_counts[obs.damage_type] += 1
-            if obs.confidence > best_conf[obs.damage_type]:
-                best_conf[obs.damage_type] = obs.confidence
+        # Normalise the damage centroid to [0, 1] within the crop
+        bx1, by1, bx2, by2 = obs.damage_bbox
+        if crop_w > 0 and crop_h > 0:
+            cx = ((bx1 + bx2) / 2.0) / crop_w
+            cy = ((by1 + by2) / 2.0) / crop_h
+        else:
+            cx, cy = 0.5, 0.5   # fallback: treat as centred
 
-        self.confirmed_damages = {
-            d_type: best_conf[d_type]
-            for d_type, votes in vote_counts.items()
-            if votes >= min_votes
-            and (votes / max(self.total_frames_seen, 1)) >= min_ratio
-        }
+        # Find the closest existing instance of the same type
+        existing = self.instances.get(obs.damage_type, [])
+        best_inst: Optional[DamageInstance] = None
+        best_dist: float = float("inf")
+        for inst in existing:
+            dist = ((cx - inst.cx_norm) ** 2 + (cy - inst.cy_norm) ** 2) ** 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_inst = inst
+
+        if best_inst is not None and best_dist <= match_radius:
+            best_inst.update(obs.confidence, cx, cy, obs.frame_index, obs.location)
+        else:
+            # Start a new spatial instance
+            new_inst = DamageInstance(damage_type=obs.damage_type)
+            new_inst.update(obs.confidence, cx, cy, obs.frame_index, obs.location)
+            self.instances.setdefault(obs.damage_type, []).append(new_inst)
+
+    def confirmed_instances(
+        self,
+        min_votes: int   = REGISTRY_MIN_VOTES,
+        min_ratio: float = REGISTRY_MIN_VOTE_RATIO,
+    ) -> List[DamageInstance]:
+        """
+        Return all spatial instances that pass the vote thresholds.
+
+        An instance is confirmed if:
+          1. ``vote_count >= min_votes``  (at least N frames)
+          2. ``vote_count / total_frames_seen >= min_ratio`` (consistent presence)
+        """
+        total = max(self.total_frames_seen, 1)
+        result: List[DamageInstance] = []
+        for inst_list in self.instances.values():
+            for inst in inst_list:
+                if inst.vote_count >= min_votes and (inst.vote_count / total) >= min_ratio:
+                    result.append(inst)
+        return result
 
 
 class DamageRegistry:
@@ -463,18 +590,22 @@ class DamageRegistry:
     ---------------
     A single car panel (e.g. "Front-bumper") may be visible from multiple
     camera angles (front, front-left-side, front-right-side).  The registry
-    now uses a *three-part key* ``(track_id, part_name, car_direction)`` so
+    uses a *three-part key* ``(track_id, part_name, car_direction)`` so
     that the same physical surface viewed from different car-centric directions
-    is tracked as a separate entity.  This prevents the old winner-takes-all
-    behaviour where one directional observation silently overwrote another,
-    and ensures that both "Left-Side Front-Door" and "Right-Side Front-Door"
-    can appear as distinct entries in the final damage report.
+    is tracked as a separate entity.
+
+    Spatial instance tracking
+    -------------------------
+    Within each PartRecord, damage observations of the same type are grouped
+    into spatial clusters (DamageInstance) based on normalised crop-centroid
+    distance.  This allows multiple physically separate damages of the same
+    type on the same part (e.g. two scratches on a bumper) to produce two
+    independent confirmed entries in the final report.
 
     Track ID strategy
     -----------------
     For ByteTrack-style pipelines, pass the YOLO-assigned track_id directly.
-    For single-car scenarios without tracking, use track_id=0 for all parts;
-    the registry still correctly aggregates per (part, direction) across frames.
+    For single-car scenarios without tracking, use track_id=0 for all parts.
     """
 
     def __init__(
@@ -496,13 +627,17 @@ class DamageRegistry:
         confidence:   float,
         car_direction: str,
         frame_index:  int,
+        damage_bbox:  Tuple[int, int, int, int] = (0, 0, 0, 0),
+        crop_size:    Tuple[int, int] = (0, 0),
     ) -> None:
         """Record a single damage observation from one frame.
 
-        The registry key is now ``(track_id, part_name, car_direction)``.
-        Damage seen on the same part from two different car-centric directions
-        will accumulate in *separate* PartRecords and appear as distinct
-        entries in the final damage report.
+        Parameters
+        ----------
+        damage_bbox : crop-relative bounding box ``(x1, y1, x2, y2)`` of the
+                      individual damage detection — used for spatial clustering.
+        crop_size   : ``(width, height)`` of the part crop — used to normalise
+                      the centroid to [0, 1] so scale changes don't matter.
         """
         key = (track_id, part_name, car_direction)
         if key not in self._records:
@@ -517,8 +652,10 @@ class DamageRegistry:
             location=location,
             car_direction=car_direction,
             frame_index=frame_index,
+            damage_bbox=damage_bbox,
         )
-        self._records[key].add_observation(obs)
+        crop_w, crop_h = crop_size
+        self._records[key].add_instance_observation(obs, crop_w, crop_h)
 
     def mark_part_seen(
         self,
@@ -549,38 +686,27 @@ class DamageRegistry:
         """
         Run voting logic on all records and return the final damage report.
 
-        Because the registry key is now ``(track_id, part_name, car_direction)``,
-        the same physical part observed from two distinct car-centric directions
-        will produce **separate entries** in the report (e.g. the left and right
-        halves of a bumper can both appear with their own damage types and
-        confidence scores).
+        Each confirmed ``DamageInstance`` within a PartRecord produces a
+        separate entry in the report.  Multiple instances of the same damage
+        type on the same part (e.g. two scratches at different locations on
+        the bumper) therefore appear as distinct rows.
 
         Returns
         -------
-        List of dicts, one per confirmed damaged location, sorted by
-        (track_id, part_name, car_direction).  Each dict contains:
+        List of dicts, one per confirmed spatial instance, sorted by
+        (track_id, part_name, car_direction, damage_type).  Each dict contains:
             track_id, part_name, car_direction, location, damage_type, confidence
         """
         report: List[Dict] = []
 
         for (track_id, part_name, car_direction), record in sorted(self._records.items()):
-            record.finalize(self._min_votes, self._min_ratio)
-
-            for d_type, best_conf in record.confirmed_damages.items():
-                # Determine the most frequent location label for this damage
-                # within *this directional view* of the part.
-                loc_votes: Dict[str, int] = defaultdict(int)
-                for obs in record.observations:
-                    if obs.damage_type == d_type:
-                        loc_votes[obs.location] += 1
-                best_loc = max(loc_votes, key=loc_votes.__getitem__) if loc_votes else part_name
-
+            for inst in record.confirmed_instances(self._min_votes, self._min_ratio):
                 report.append({
                     "part_name":    part_name,
                     "car_direction": car_direction,
-                    "location":     best_loc,
-                    "damage_type":  d_type,
-                    "confidence":   round(best_conf, 4),
+                    "location":     inst.best_location or part_name,
+                    "damage_type":  inst.damage_type,
+                    "confidence":   round(inst.best_conf, 4),
                 })
 
         return report
@@ -645,25 +771,28 @@ class DamageRegistry:
             return "\n".join(lines)
 
         for (track_id, part_name, car_direction), record in sorted(self._records.items()):
-            vote_counts: Dict[str, int] = defaultdict(int)
-            best_conf:   Dict[str, float] = defaultdict(float)
-            for obs in record.observations:
-                vote_counts[obs.damage_type] += 1
-                if obs.confidence > best_conf[obs.damage_type]:
-                    best_conf[obs.damage_type] = obs.confidence
+            seen     = record.total_frames_seen
+            part_key = f"{part_name} ({car_direction})"
 
-            seen      = record.total_frames_seen
-            part_key  = f"{part_name} ({car_direction})"
-            if not vote_counts:
+            # Collect all instances across damage types for debug display
+            all_instances: List[DamageInstance] = [
+                inst
+                for inst_list in record.instances.values()
+                for inst in inst_list
+            ]
+
+            if not all_instances:
                 lines.append(
                     f"  [Track {track_id:>3}] {part_key:<40} seen={seen:>3}  |  "
                     f"(no damage detected on this part)"
                 )
             else:
-                for d_type, votes in sorted(vote_counts.items(),
-                                            key=lambda x: x[1], reverse=True):
-                    ratio = votes / max(seen, 1)
-                    conf  = best_conf[d_type]
+                # Sort by damage type then descending vote count
+                for inst in sorted(all_instances,
+                                   key=lambda i: (i.damage_type, -i.vote_count)):
+                    votes    = inst.vote_count
+                    ratio    = votes / max(seen, 1)
+                    conf     = inst.best_conf
                     passes_v = votes >= self._min_votes
                     passes_r = ratio >= self._min_ratio
                     verdict  = "CONFIRMED" if (passes_v and passes_r) else (
@@ -673,8 +802,9 @@ class DamageRegistry:
                     )
                     lines.append(
                         f"  [Track {track_id:>3}] {part_key:<40} seen={seen:>3}  |  "
-                        f"{d_type:<14} {votes:>2} votes  "
-                        f"ratio={ratio:.2f}  conf={conf:.2f}  {verdict}"
+                        f"{inst.damage_type:<14} {votes:>2} votes  "
+                        f"ratio={ratio:.2f}  conf={conf:.2f}  "
+                        f"centroid=({inst.cx_norm:.2f},{inst.cy_norm:.2f})  {verdict}"
                     )
 
         lines.append("=" * 80)
@@ -685,7 +815,12 @@ class DamageRegistry:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _directions_overlap(d1: str, d2: str) -> bool:
-    """Return True if d1 and d2 belong to the same physical overlap group."""
+    """Return True if d1 and d2 belong to the same physical overlap group.
+
+    Two directions are considered overlapping when they are co-members of a
+    single entry in ``DIRECTION_OVERLAP_GROUPS`` — meaning a camera shot from
+    either angle can physically capture the same panel location.
+    """
     for group in DIRECTION_OVERLAP_GROUPS:
         if d1 in group and d2 in group:
             return True
@@ -696,19 +831,20 @@ def deduplicate_report(report: List[Dict]) -> List[Dict]:
     """
     Remove duplicate damage entries caused by overlapping camera angles.
 
-    Problem
-    -------
-    A scratch on a fender photographed from a "right-side" angle and again
-    from a "front-right-side" angle produces two separate registry entries
-    (because the registry key includes ``car_direction``) even though they
-    describe the same physical damage.
+    Rules
+    -----
+    **Corner parts** (``CORNER_PARTS``, e.g. Front-bumper, Back-bumper)
+        These parts wrap around a physical corner of the car.  The front-left
+        and front-right extremities of a bumper are genuinely different
+        locations, so every distinct ``car_direction`` is kept as a separate
+        entry — no merging is performed for these parts.
 
-    Strategy
-    --------
-    For every pair of entries that share the same ``part_name`` and
-    ``damage_type`` *and* whose directions belong to the same overlap group
-    (see ``DIRECTION_OVERLAP_GROUPS``), keep only the entry with the higher
-    confidence score.
+    **All other parts** (doors, fenders, hood, trunk, lights, …)
+        A panel damage seen from "front-right-side" and again from "right-side"
+        is the same physical scratch filmed from two overlapping angles.  When
+        the same ``(part_name, damage_type)`` pair appears in directions that
+        belong to the same overlap group (``DIRECTION_OVERLAP_GROUPS``), only
+        the higher-confidence observation is retained.
 
     Returns
     -------
@@ -717,6 +853,11 @@ def deduplicate_report(report: List[Dict]) -> List[Dict]:
     """
     kept: List[Dict] = []
     for item in report:
+        # Corner parts: direction is part of the unique identity — never merge.
+        if item["part_name"] in CORNER_PARTS:
+            kept.append(dict(item))
+            continue
+
         merged = False
         for existing in kept:
             if (
@@ -724,8 +865,8 @@ def deduplicate_report(report: List[Dict]) -> List[Dict]:
                 and existing["damage_type"] == item["damage_type"]
                 and _directions_overlap(existing["car_direction"], item["car_direction"])
             ):
-                # Same physical damage from an overlapping angle — keep the
-                # higher-confidence observation and discard the other.
+                # Same physical damage seen from an overlapping angle — keep
+                # the higher-confidence observation and discard the other.
                 if item["confidence"] > existing["confidence"]:
                     existing.update(item)
                 merged = True
@@ -864,8 +1005,11 @@ class DamageDetector:
         boxes   = results[0].boxes
         masks   = results[0].masks
 
-        # Collect the best confidence per allowed damage type
-        best_per_type: Dict[str, Tuple[float, int]] = {}  # type → (conf, box_idx)
+        # Collect ALL valid detections, keeping each box as a candidate instance.
+        # Two detections of the same type that are spatially separated on the crop
+        # are kept as distinct candidates; the registry will cluster them later.
+        candidates: List[Tuple[str, float, int, Tuple[int,int,int,int]]] = []
+        #            (damage_type, conf, box_idx, crop_bbox)
         for idx, box in enumerate(boxes):
             d_cls  = int(box.cls[0])
             d_type = self.model.names[d_cls]
@@ -875,22 +1019,46 @@ class DamageDetector:
                 continue
             if not passes_damage_threshold(d_type, d_conf):
                 continue
-            if d_type not in best_per_type or d_conf > best_per_type[d_type][0]:
-                best_per_type[d_type] = (d_conf, idx)
 
-        if not best_per_type:
+            bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+            candidates.append((d_type, d_conf, idx, (bx1, by1, bx2, by2)))
+
+        if not candidates:
             return []
 
-        # Build the result list — one entry per distinct damage type, sorted by
-        # descending confidence so the caller can easily identify the primary damage.
-        dmg_list: List[Tuple[str, float, Optional[np.ndarray]]] = []
-        for d_type, (d_conf, box_idx) in sorted(
-            best_per_type.items(), key=lambda kv: kv[1][0], reverse=True
-        ):
+        # Merge heavily-overlapping boxes of the same type (IoU > 0.5) that the
+        # model emits as duplicate detections of the *same* physical damage.
+        # Distinct spatial damages (low IoU) are preserved as separate entries.
+        def _iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
+            ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+            ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            if inter == 0:
+                return 0.0
+            area_a = (a[2]-a[0]) * (a[3]-a[1])
+            area_b = (b[2]-b[0]) * (b[3]-b[1])
+            return inter / (area_a + area_b - inter)
+
+        # Sort by descending confidence so we always keep the best box when merging
+        candidates.sort(key=lambda c: c[1], reverse=True)
+        kept_candidates: List[Tuple[str, float, int, Tuple[int,int,int,int]]] = []
+        for cand in candidates:
+            d_type, d_conf, box_idx, cbox = cand
+            suppress = False
+            for kept in kept_candidates:
+                if kept[0] == d_type and _iou(cbox, kept[3]) > 0.50:
+                    suppress = True   # duplicate box — already have a better one
+                    break
+            if not suppress:
+                kept_candidates.append(cand)
+
+        # Build the result list — one entry per surviving candidate instance
+        dmg_list: List[Tuple[str, float, Optional[np.ndarray], Tuple[int,int,int,int]]] = []
+        for d_type, d_conf, box_idx, cbox in kept_candidates:
             mask_pts = None
             if masks is not None and box_idx < len(masks.xy):
                 mask_pts = masks.xy[box_idx].astype(np.int32)
-            dmg_list.append((d_type, d_conf, mask_pts))
+            dmg_list.append((d_type, d_conf, mask_pts, cbox))
 
         return dmg_list
 
@@ -1058,14 +1226,17 @@ class CarDamagePipeline:
             # label_idx is used below to stack multiple HUD labels vertically
             # so they don't overlap when several damage types share one bbox.
             location = resolve_damage_location(part_name, stable_dir)
-            for label_idx, (d_type, d_conf, d_mask_pts) in enumerate(dmg_results):
+            crop_w = x2 - x1
+            crop_h = y2 - y1
+            for label_idx, (d_type, d_conf, d_mask_pts, d_bbox) in enumerate(dmg_results):
 
                 # Translate crop-relative mask coordinates to frame coordinates
                 if d_mask_pts is not None:
                     d_mask_pts = (d_mask_pts + np.array([x1, y1])).astype(np.int32)
 
-                # Update the temporal registry (vote tallies are per damage_type,
-                # so each type accumulates its own independent evidence)
+                # Update the temporal registry with spatial instance tracking.
+                # damage_bbox is crop-relative; crop_size lets the registry
+                # normalise the centroid to [0,1] for scale-invariant clustering.
                 self.registry.update(
                     track_id=track_id,
                     part_name=part_name,
@@ -1073,6 +1244,8 @@ class CarDamagePipeline:
                     confidence=d_conf,
                     car_direction=stable_dir,
                     frame_index=frame_index,
+                    damage_bbox=d_bbox,
+                    crop_size=(crop_w, crop_h),
                 )
 
                 drawings.append({
@@ -1408,7 +1581,7 @@ Examples — Video:
 Examples — Image:
   python pipeline.py car.jpg
   python pipeline.py car.png --output result.jpg --report report.json
-  python pipeline.py car.jpg --parts-conf 0.25 --damage-conf 0.25 --debug
+  python pipeline.py car.jpg --parts-conf 0.25 --damage-conf 0.25  
         """,
     )
     ap.add_argument("input",
