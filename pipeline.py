@@ -161,6 +161,7 @@ _BODY_PANEL_DEFAULT = ["dent", "scratch", "smash", "crack"]
 # Lowered defaults — 3 votes works well for short walkaround clips.
 # Raise these values to reduce false positives on longer recordings.
 REGISTRY_MIN_VOTES      = 5    # minimum frames a damage must appear to be "confirmed"
+REGISTRY_MIN_VOTE_RATIO = 0.15  # damage seen in >= 15% of frames it was observable
 DIRECTION_BUFFER_LEN    = 3    # consecutive high-conf frames needed to commit to a new direction
 DIRECTION_CONF_THRESHOLD = 0.60  # minimum classifier confidence to accept a direction
 INSTANCE_MATCH_RADIUS = 0.30
@@ -534,17 +535,20 @@ class PartRecord:
     def confirmed_instances(
         self,
         min_votes: int   = REGISTRY_MIN_VOTES,
+        min_ratio: float = REGISTRY_MIN_VOTE_RATIO,
     ) -> List[DamageInstance]:
         """
         Return all damage instances that pass the vote thresholds.
 
         An instance is confirmed if:
           1. ``vote_count >= min_votes``  (at least N frames)
+          2. ``vote_count / total_frames_seen >= min_ratio`` (consistent presence)
         """
+        total = max(self.total_frames_seen, 1)
         result: List[DamageInstance] = []
         for inst_list in self.instances.values():
             for inst in inst_list:
-                if inst.vote_count >= min_votes:
+                if inst.vote_count >= min_votes and (inst.vote_count / total) >= min_ratio:
                     result.append(inst)
         return result
 
@@ -570,8 +574,10 @@ class DamageRegistry:
     def __init__(
         self,
         min_votes: int  = REGISTRY_MIN_VOTES,
+        min_ratio: float = REGISTRY_MIN_VOTE_RATIO,
     ) -> None:
         self._min_votes = min_votes
+        self._min_ratio = min_ratio
         # key: (track_id, part_name, car_direction)  →  PartRecord
         self._records: Dict[Tuple[int, str, str], PartRecord] = {}
 
@@ -651,7 +657,7 @@ class DamageRegistry:
         report: List[Dict] = []
 
         for (track_id, part_name, car_direction), record in sorted(self._records.items()):
-            for inst in record.confirmed_instances(self._min_votes):
+            for inst in record.confirmed_instances(self._min_votes, self._min_ratio):
                 report.append({
                     "part_name":    part_name,
                     "car_direction": car_direction,
@@ -742,13 +748,19 @@ class DamageRegistry:
                 for inst in sorted(all_instances,
                                    key=lambda i: (i.damage_type, -i.vote_count)):
                     votes    = inst.vote_count
+                    ratio    = votes / max(seen, 1)
                     conf     = inst.best_conf
                     passes_v = votes >= self._min_votes
-                    verdict  = "CONFIRMED" if passes_v else f"FAIL(votes<{self._min_votes})"
+                    passes_r = ratio >= self._min_ratio
+                    verdict  = "CONFIRMED" if (passes_v and passes_r) else (
+                        f"FAIL({'votes<'+str(self._min_votes) if not passes_v else ''}"
+                        f"{',' if not passes_v and not passes_r else ''}"
+                        f"{'ratio<'+f'{self._min_ratio:.0%}' if not passes_r else ''})"
+                    )
                     lines.append(
                         f"  [Track {track_id:>3}] {part_key:<40} seen={seen:>3}  |  "
                         f"{inst.damage_type:<14} {votes:>2} votes  "
-                        f"conf={conf:.2f}  "
+                        f"ratio={ratio:.2f}  conf={conf:.2f}  "
                         f"centroid=({inst.cx_norm:.2f},{inst.cy_norm:.2f})  "
                         f"{verdict}"
                     )
@@ -1049,6 +1061,7 @@ class CarDamagePipeline:
         parts_conf_floor:  float = 0.30,
         damage_conf_floor: float = 0.30,
         min_votes:         int   = REGISTRY_MIN_VOTES,
+        min_ratio:         float = REGISTRY_MIN_VOTE_RATIO,
     ) -> None:
         log.info("Loading models …")
         self.direction_clf  = DirectionClassifier(MODEL_ANGLE_PATH)
@@ -1060,7 +1073,7 @@ class CarDamagePipeline:
         self.damage_conf_floor = damage_conf_floor
 
         self.dir_buffer = DirectionBuffer()
-        self.registry   = DamageRegistry(min_votes=min_votes)
+        self.registry   = DamageRegistry(min_votes=min_votes, min_ratio=min_ratio)
 
         # font config (used by drawing helpers)
         self._font      = cv2.FONT_HERSHEY_SIMPLEX
@@ -1285,6 +1298,7 @@ def run_video(
     save_damage:       bool  = True,
     report_path:       Optional[str] = None,
     min_votes:         int   = REGISTRY_MIN_VOTES,
+    min_ratio:         float = REGISTRY_MIN_VOTE_RATIO,
     debug:             bool  = False,
 ) -> None:
     """
@@ -1299,9 +1313,9 @@ def run_video(
     log.info("Output : %s", output_path)
     log.info("=" * 65)
     log.info(
-        "Thresholds : votes>=%d  dir_conf>=%.2f  "
+        "Thresholds : votes>=%d  ratio>=%.0f%%  dir_conf>=%.2f  "
         "dir_buffer=%d",
-        min_votes, DIRECTION_CONF_THRESHOLD,
+        min_votes, min_ratio * 100, DIRECTION_CONF_THRESHOLD,
         DIRECTION_BUFFER_LEN,
     )
 
@@ -1309,6 +1323,7 @@ def run_video(
         parts_conf_floor=parts_conf,
         damage_conf_floor=damage_conf,
         min_votes=min_votes,
+        min_ratio=min_ratio,
     )
 
     cap = cv2.VideoCapture(video_path)
@@ -1461,11 +1476,12 @@ def run_image(
     log.info("Resolution : %dx%d", w, h)
 
     # For a single image bypass temporal voting — every detection is
-    # immediately confirmed (min_votes=1).
+    # immediately confirmed (min_votes=1, min_ratio=0.0).
     pipeline = CarDamagePipeline(
         parts_conf_floor=parts_conf,
         damage_conf_floor=damage_conf,
         min_votes=1,
+        min_ratio=0.0,
     )
 
     parts_frm, damage_frm, stable_dir = pipeline.process_frame(
@@ -1547,6 +1563,8 @@ Examples — Image:
                     help="[Video only] Skip damage output video")
     ap.add_argument("--min-votes",   type=int, default=REGISTRY_MIN_VOTES,
                     help=f"[Video only] Min frames to confirm damage (default: {REGISTRY_MIN_VOTES})")
+    ap.add_argument("--min-ratio",   type=float, default=REGISTRY_MIN_VOTE_RATIO,
+                    help=f"[Video only] Min frame ratio to confirm damage (default: {REGISTRY_MIN_VOTE_RATIO})")
     # ── Shared flags ───────────────────────────────────────────────────────────
     ap.add_argument("--report",      default=None,
                     help="Optional path to save JSON damage report")
@@ -1585,5 +1603,6 @@ Examples — Image:
             save_damage = not args.no_damage,
             report_path = args.report,
             min_votes   = args.min_votes,
+            min_ratio   = args.min_ratio,
             debug       = args.debug,
         )
