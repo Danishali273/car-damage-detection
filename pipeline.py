@@ -160,9 +160,10 @@ _BODY_PANEL_DEFAULT = ["dent", "scratch", "smash", "crack"]
 # ── DamageRegistry voting parameters ─────────────────────────────────────────
 # Lowered defaults — 3 votes works well for short walkaround clips.
 # Raise these values to reduce false positives on longer recordings.
-REGISTRY_MIN_VOTES      = 3    # minimum frames a damage must appear to be "confirmed"
+REGISTRY_MIN_VOTES      = 5    # minimum frames a damage must appear to be "confirmed"
 DIRECTION_BUFFER_LEN    = 3    # consecutive high-conf frames needed to commit to a new direction
 DIRECTION_CONF_THRESHOLD = 0.60  # minimum classifier confidence to accept a direction
+INSTANCE_MATCH_RADIUS = 0.30
 
 # ── Overlapping direction groups (for cross-view deduplication) ───────────────
 # Directions within the same group share physical overlap, so the same scratch
@@ -406,16 +407,19 @@ class DamageInstance:
     damage_type    : e.g. "scratch"
     vote_count     : number of frames this instance was observed
     best_conf      : highest confidence seen across all observations
+    cx_norm, cy_norm : running mean of the normalised centroid
     frames_seen    : set of frame indices (prevents double-counting)
     location       : human-readable compound label (most-voted)
     """
     damage_type: str
     vote_count:  int = 0
     best_conf:   float = 0.0
+    cx_norm:     float = 0.0
+    cy_norm:     float = 0.0
     frames_seen: Set[int] = field(default_factory=set)
     _loc_votes:  Dict[str, int] = field(default_factory=dict)
 
-    def update(self, conf: float, frame_index: int, location: str) -> None:
+    def update(self, conf: float, cx: float, cy: float, frame_index: int, location: str) -> None:
         """Absorb a new observation into this instance."""
         if frame_index in self.frames_seen:
             # Already counted this frame — only update confidence if higher
@@ -426,6 +430,10 @@ class DamageInstance:
         self.vote_count += 1
         if conf > self.best_conf:
             self.best_conf = conf
+        # Incremental mean update for the centroid
+        n = self.vote_count
+        self.cx_norm += (cx - self.cx_norm) / n
+        self.cy_norm += (cy - self.cy_norm) / n
         self._loc_votes[location] = self._loc_votes.get(location, 0) + 1
 
     @property
@@ -448,14 +456,14 @@ class PartRecord:
 
     Fields
     ------
-    instances     : damage_type → DamageInstance tracker
+    instances     : damage_type → list of spatial clusters (DamageInstance)
     _seen_frames  : set of unique frame indices where this part was visible
     """
     part_name:     str
     track_id:      int
     car_direction: str
-    # damage_type → DamageInstance tracker
-    instances:    Dict[str, DamageInstance] = field(default_factory=dict)
+    # damage_type → list of DamageInstance clusters
+    instances:    Dict[str, List[DamageInstance]] = field(default_factory=dict)
     _seen_frames: Set[int] = field(default_factory=set)
 
     @property
@@ -473,15 +481,55 @@ class PartRecord:
         confidence: float,
         frame_index: int,
         location: str,
+        damage_bbox: Tuple[int, int, int, int],
+        crop_size: Tuple[int, int],
+        match_radius: float = INSTANCE_MATCH_RADIUS,
     ) -> None:
         """
-        Record a damage observation of a given type.
+        Record a damage observation of a given type, clustering spatially.
         """
         self._seen_frames.add(frame_index)
 
+        crop_w, crop_h = crop_size
+        bx1, by1, bx2, by2 = damage_bbox
+        if crop_w > 0 and crop_h > 0:
+            cx = ((bx1 + bx2) / 2.0) / crop_w
+            cy = ((by1 + by2) / 2.0) / crop_h
+        else:
+            cx, cy = 0.5, 0.5
+
         if damage_type not in self.instances:
-            self.instances[damage_type] = DamageInstance(damage_type=damage_type)
-        self.instances[damage_type].update(confidence, frame_index, location)
+            self.instances[damage_type] = []
+
+        # Find the closest existing instance of this damage type
+        existing_list = self.instances[damage_type]
+        best_inst: Optional[DamageInstance] = None
+        best_dist: float = float("inf")
+
+        for inst in existing_list:
+            # Aspect-Ratio Preserving Distance
+            w2 = crop_w ** 2
+            h2 = crop_h ** 2
+            diag2 = w2 + h2
+            if diag2 > 0:
+                w_weight = w2 / diag2
+                h_weight = h2 / diag2
+            else:
+                w_weight, h_weight = 0.5, 0.5
+            
+            dist = (w_weight * (cx - inst.cx_norm) ** 2 + 
+                    h_weight * (cy - inst.cy_norm) ** 2) ** 0.5
+            
+            if dist < best_dist:
+                best_dist = dist
+                best_inst = inst
+
+        if best_inst is not None and best_dist <= match_radius:
+            best_inst.update(confidence, cx, cy, frame_index, location)
+        else:
+            new_inst = DamageInstance(damage_type=damage_type)
+            new_inst.update(confidence, cx, cy, frame_index, location)
+            existing_list.append(new_inst)
 
     def confirmed_instances(
         self,
@@ -494,9 +542,10 @@ class PartRecord:
           1. ``vote_count >= min_votes``  (at least N frames)
         """
         result: List[DamageInstance] = []
-        for inst in self.instances.values():
-            if inst.vote_count >= min_votes:
-                result.append(inst)
+        for inst_list in self.instances.values():
+            for inst in inst_list:
+                if inst.vote_count >= min_votes:
+                    result.append(inst)
         return result
 
 
@@ -542,8 +591,8 @@ class DamageRegistry:
 
         Parameters
         ----------
-        damage_bbox : Ignored (retained for signature compatibility)
-        crop_size   : Ignored (retained for signature compatibility)
+        damage_bbox : crop-relative bounding box of the individual damage detection
+        crop_size   : (width, height) of the part crop
         """
         key = (track_id, part_name, car_direction)
         if key not in self._records:
@@ -557,6 +606,8 @@ class DamageRegistry:
             confidence=confidence,
             frame_index=frame_index,
             location=location,
+            damage_bbox=damage_bbox,
+            crop_size=crop_size,
         )
 
     def mark_part_seen(
@@ -675,7 +726,11 @@ class DamageRegistry:
             part_key = f"{part_name} ({car_direction})"
 
             # Collect all instances across damage types for debug display
-            all_instances: List[DamageInstance] = list(record.instances.values())
+            all_instances: List[DamageInstance] = [
+                inst
+                for inst_list in record.instances.values()
+                for inst in inst_list
+            ]
 
             if not all_instances:
                 lines.append(
@@ -694,6 +749,7 @@ class DamageRegistry:
                         f"  [Track {track_id:>3}] {part_key:<40} seen={seen:>3}  |  "
                         f"{inst.damage_type:<14} {votes:>2} votes  "
                         f"conf={conf:.2f}  "
+                        f"centroid=({inst.cx_norm:.2f},{inst.cy_norm:.2f})  "
                         f"{verdict}"
                     )
 
