@@ -82,20 +82,20 @@ CAR_PARTS_MAP: Dict[str, List[str]] = {
         "Fender", "Quarter-panel", "Mirror", "Rocker-panel",
     ],
     "front-left-side": [
-        "Front-bumper", "Fender", "Front-door", "Front-wheel",
-        "Mirror", "Hood", "Headlight", "Windshield",
+        "Front-bumper", "Fender", "Mirror",
+        "Hood", "Headlight", "Windshield",
     ],
     "front-right-side": [
-        "Front-bumper", "Fender", "Front-door", "Front-wheel",
-        "Mirror", "Hood", "Headlight", "Windshield",
+        "Front-bumper", "Fender", "Mirror",
+        "Hood", "Headlight", "Windshield",
     ],
     "back-left-side": [
-        "Back-bumper", "Quarter-panel", "Back-door",
-        "Back-wheel", "Tail-light", "Back-windshield",
+        "Back-bumper", "Quarter-panel",
+        "Tail-light", "Back-windshield",
     ],
     "back-right-side": [
-        "Back-bumper", "Quarter-panel", "Back-door",
-        "Back-wheel", "Tail-light", "Back-windshield",
+        "Back-bumper", "Quarter-panel",
+        "Tail-light", "Back-windshield",
     ],
 }
 
@@ -161,16 +161,9 @@ _BODY_PANEL_DEFAULT = ["dent", "scratch", "smash", "crack"]
 # Lowered defaults — 3 votes + 25 % ratio works well for short walkaround clips.
 # Raise these values to reduce false positives on longer recordings.
 REGISTRY_MIN_VOTES      = 3    # minimum frames a damage must appear to be "confirmed"
-REGISTRY_MIN_VOTE_RATIO = 0.20  # damage seen in >= 15 % of frames it was observable
+REGISTRY_MIN_VOTE_RATIO = 0.20  # damage seen in >= 20 % of frames it was observable
 DIRECTION_BUFFER_LEN    = 3    # consecutive high-conf frames needed to commit to a new direction
 DIRECTION_CONF_THRESHOLD = 0.60  # minimum classifier confidence to accept a direction
-
-# ── Spatial instance-tracking parameters ─────────────────────────────────────
-# Two damage detections of the same type on the same part are treated as the
-# *same physical instance* when their normalised centroids (relative to the
-# part crop) are closer than INSTANCE_MATCH_RADIUS.  Increase this value to
-# merge nearby detections more aggressively; decrease it to split them sooner.
-INSTANCE_MATCH_RADIUS = 0.30   # fraction of crop diagonal
 
 # ── Overlapping direction groups (for cross-view deduplication) ───────────────
 # Directions within the same group share physical overlap, so the same scratch
@@ -405,50 +398,25 @@ def resolve_damage_location(part_name: str, car_direction: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
-class DamageObservation:
-    """A single per-frame observation of a damage event on a part."""
-    damage_type:  str
-    confidence:   float
-    location:     str              # e.g. "Front-Left-Side Front-Door"
-    car_direction: str
-    frame_index:  int
-    # Crop-relative bounding box of the individual damage detection.
-    # Used by PartRecord to cluster spatially-distinct instances of the
-    # same damage type (e.g. two separate scratches on one bumper).
-    damage_bbox:  Tuple[int, int, int, int] = field(default_factory=lambda: (0, 0, 0, 0))
-
-
-@dataclass
 class DamageInstance:
     """
-    A single spatial cluster of one damage type on a part.
-
-    Multiple per-frame detections of the same ``damage_type`` that land
-    within ``INSTANCE_MATCH_RADIUS`` of each other (normalised centroid
-    distance, relative to the part crop) are accumulated here.  Each
-    instance has its own independent vote counter so that two physically
-    separate scratches on the same bumper produce two confirmed entries.
+    Accumulated damage evidence for one damage type on a part.
 
     Fields
     ------
     damage_type    : e.g. "scratch"
     vote_count     : number of frames this instance was observed
     best_conf      : highest confidence seen across all observations
-    cx_norm, cy_norm : running mean of the normalised centroid
-                       (updated incrementally; never stored as history)
     frames_seen    : set of frame indices (prevents double-counting)
     location       : human-readable compound label (most-voted)
     """
     damage_type: str
     vote_count:  int = 0
     best_conf:   float = 0.0
-    cx_norm:     float = 0.0   # running mean, normalised to [0, 1]
-    cy_norm:     float = 0.0
     frames_seen: Set[int] = field(default_factory=set)
     _loc_votes:  Dict[str, int] = field(default_factory=dict)
 
-    def update(self, conf: float, cx: float, cy: float,
-               frame_index: int, location: str) -> None:
+    def update(self, conf: float, frame_index: int, location: str) -> None:
         """Absorb a new observation into this instance."""
         if frame_index in self.frames_seen:
             # Already counted this frame — only update confidence if higher
@@ -459,10 +427,6 @@ class DamageInstance:
         self.vote_count += 1
         if conf > self.best_conf:
             self.best_conf = conf
-        # Incremental mean update for the centroid
-        n = self.vote_count
-        self.cx_norm += (cx - self.cx_norm) / n
-        self.cy_norm += (cy - self.cy_norm) / n
         self._loc_votes[location] = self._loc_votes.get(location, 0) + 1
 
     @property
@@ -483,23 +447,16 @@ class PartRecord:
     directions (e.g. "front" vs "front-left-side") is treated as a separate
     entity in the registry.
 
-    Spatial instance tracking
-    -------------------------
-    Damage detections of the same type are grouped into ``DamageInstance``
-    clusters based on normalised crop-centroid proximity.  Each cluster has
-    its own independent vote counter, so two separate scratches on the same
-    bumper produce two confirmed entries instead of one.
-
     Fields
     ------
-    instances     : damage_type → list of spatial clusters (DamageInstance)
+    instances     : damage_type → DamageInstance tracker
     _seen_frames  : set of unique frame indices where this part was visible
     """
     part_name:     str
     track_id:      int
     car_direction: str
-    # damage_type → list of DamageInstance clusters
-    instances:    Dict[str, List[DamageInstance]] = field(default_factory=dict)
+    # damage_type → DamageInstance tracker
+    instances:    Dict[str, DamageInstance] = field(default_factory=dict)
     _seen_frames: Set[int] = field(default_factory=set)
 
     @property
@@ -511,55 +468,21 @@ class PartRecord:
         """Record that this part was visible on a given frame."""
         self._seen_frames.add(frame_index)
 
-    def add_instance_observation(
+    def add_damage_observation(
         self,
-        obs: DamageObservation,
-        crop_w: int,
-        crop_h: int,
-        match_radius: float = INSTANCE_MATCH_RADIUS,
+        damage_type: str,
+        confidence: float,
+        frame_index: int,
+        location: str,
     ) -> None:
         """
-        Assign the observation to an existing spatial instance or create a new one.
-
-        The normalised centroid of the damage bbox (relative to the part crop)
-        is compared against existing instances of the same damage type.  If the
-        distance is below ``match_radius`` (as a fraction of the crop diagonal),
-        the observation is merged into that instance; otherwise a new instance
-        is started.
-
-        Parameters
-        ----------
-        obs         : the damage observation to record
-        crop_w/h    : width and height of the part crop (used for normalisation)
-        match_radius: maximum normalised centroid distance to merge instances
+        Record a damage observation of a given type.
         """
-        self._seen_frames.add(obs.frame_index)
+        self._seen_frames.add(frame_index)
 
-        # Normalise the damage centroid to [0, 1] within the crop
-        bx1, by1, bx2, by2 = obs.damage_bbox
-        if crop_w > 0 and crop_h > 0:
-            cx = ((bx1 + bx2) / 2.0) / crop_w
-            cy = ((by1 + by2) / 2.0) / crop_h
-        else:
-            cx, cy = 0.5, 0.5   # fallback: treat as centred
-
-        # Find the closest existing instance of the same type
-        existing = self.instances.get(obs.damage_type, [])
-        best_inst: Optional[DamageInstance] = None
-        best_dist: float = float("inf")
-        for inst in existing:
-            dist = ((cx - inst.cx_norm) ** 2 + (cy - inst.cy_norm) ** 2) ** 0.5
-            if dist < best_dist:
-                best_dist = dist
-                best_inst = inst
-
-        if best_inst is not None and best_dist <= match_radius:
-            best_inst.update(obs.confidence, cx, cy, obs.frame_index, obs.location)
-        else:
-            # Start a new spatial instance
-            new_inst = DamageInstance(damage_type=obs.damage_type)
-            new_inst.update(obs.confidence, cx, cy, obs.frame_index, obs.location)
-            self.instances.setdefault(obs.damage_type, []).append(new_inst)
+        if damage_type not in self.instances:
+            self.instances[damage_type] = DamageInstance(damage_type=damage_type)
+        self.instances[damage_type].update(confidence, frame_index, location)
 
     def confirmed_instances(
         self,
@@ -567,7 +490,7 @@ class PartRecord:
         min_ratio: float = REGISTRY_MIN_VOTE_RATIO,
     ) -> List[DamageInstance]:
         """
-        Return all spatial instances that pass the vote thresholds.
+        Return all damage instances that pass the vote thresholds.
 
         An instance is confirmed if:
           1. ``vote_count >= min_votes``  (at least N frames)
@@ -575,10 +498,9 @@ class PartRecord:
         """
         total = max(self.total_frames_seen, 1)
         result: List[DamageInstance] = []
-        for inst_list in self.instances.values():
-            for inst in inst_list:
-                if inst.vote_count >= min_votes and (inst.vote_count / total) >= min_ratio:
-                    result.append(inst)
+        for inst in self.instances.values():
+            if inst.vote_count >= min_votes and (inst.vote_count / total) >= min_ratio:
+                result.append(inst)
         return result
 
 
@@ -593,14 +515,6 @@ class DamageRegistry:
     uses a *three-part key* ``(track_id, part_name, car_direction)`` so
     that the same physical surface viewed from different car-centric directions
     is tracked as a separate entity.
-
-    Spatial instance tracking
-    -------------------------
-    Within each PartRecord, damage observations of the same type are grouped
-    into spatial clusters (DamageInstance) based on normalised crop-centroid
-    distance.  This allows multiple physically separate damages of the same
-    type on the same part (e.g. two scratches on a bumper) to produce two
-    independent confirmed entries in the final report.
 
     Track ID strategy
     -----------------
@@ -634,10 +548,8 @@ class DamageRegistry:
 
         Parameters
         ----------
-        damage_bbox : crop-relative bounding box ``(x1, y1, x2, y2)`` of the
-                      individual damage detection — used for spatial clustering.
-        crop_size   : ``(width, height)`` of the part crop — used to normalise
-                      the centroid to [0, 1] so scale changes don't matter.
+        damage_bbox : Ignored (retained for signature compatibility)
+        crop_size   : Ignored (retained for signature compatibility)
         """
         key = (track_id, part_name, car_direction)
         if key not in self._records:
@@ -646,16 +558,12 @@ class DamageRegistry:
             )
 
         location = resolve_damage_location(part_name, car_direction)
-        obs = DamageObservation(
+        self._records[key].add_damage_observation(
             damage_type=damage_type,
             confidence=confidence,
-            location=location,
-            car_direction=car_direction,
             frame_index=frame_index,
-            damage_bbox=damage_bbox,
+            location=location,
         )
-        crop_w, crop_h = crop_size
-        self._records[key].add_instance_observation(obs, crop_w, crop_h)
 
     def mark_part_seen(
         self,
@@ -775,11 +683,7 @@ class DamageRegistry:
             part_key = f"{part_name} ({car_direction})"
 
             # Collect all instances across damage types for debug display
-            all_instances: List[DamageInstance] = [
-                inst
-                for inst_list in record.instances.values()
-                for inst in inst_list
-            ]
+            all_instances: List[DamageInstance] = list(record.instances.values())
 
             if not all_instances:
                 lines.append(
@@ -804,7 +708,7 @@ class DamageRegistry:
                         f"  [Track {track_id:>3}] {part_key:<40} seen={seen:>3}  |  "
                         f"{inst.damage_type:<14} {votes:>2} votes  "
                         f"ratio={ratio:.2f}  conf={conf:.2f}  "
-                        f"centroid=({inst.cx_norm:.2f},{inst.cy_norm:.2f})  {verdict}"
+                        f"{verdict}"
                     )
 
         lines.append("=" * 80)
