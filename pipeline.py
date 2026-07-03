@@ -472,24 +472,45 @@ class PartRecord:
         frame_index: int,
         location: str,
         direction: str,
-        damage_bbox: Tuple[int, int, int, int],
+        damage_mask: Optional[np.ndarray],
         crop_size: Tuple[int, int],
+        damage_bbox: Tuple[int, int, int, int] = (0, 0, 0, 0),
         match_radius: float = INSTANCE_MATCH_RADIUS,
     ) -> None:
         """
         Record a damage observation of a given type, clustering spatially.
+
+        Geometry is derived from the segmentation mask when available:
+          • Centroid is computed via cv2.moments on the crop-relative mask polygon.
+          • Falls back to the bounding-box centroid when damage_mask is None or
+            degenerate (e.g. fewer than 3 points).
         """
         if direction not in self._seen_frames_per_dir:
             self._seen_frames_per_dir[direction] = set()
         self._seen_frames_per_dir[direction].add(frame_index)
 
         crop_w, crop_h = crop_size
-        bx1, by1, bx2, by2 = damage_bbox
-        if crop_w > 0 and crop_h > 0:
+        cx, cy = 0.5, 0.5  # safe defaults
+
+        if damage_mask is not None and damage_mask.size >= 6:
+            # Compute the true geometric centroid of the segmentation mask using
+            # OpenCV image moments.  The mask polygon is in crop-relative coords.
+            M = cv2.moments(damage_mask.astype(np.float32))
+            if M["m00"] > 1e-6:
+                # Normalise by the crop dimensions, identical normalisation to
+                # the old box-centroid path so the match_radius threshold stays valid.
+                cx = (M["m10"] / M["m00"]) / crop_w if crop_w > 0 else 0.5
+                cy = (M["m01"] / M["m00"]) / crop_h if crop_h > 0 else 0.5
+            elif crop_w > 0 and crop_h > 0:
+                # Degenerate moment (zero-area contour) — fall back to bbox centroid
+                bx1, by1, bx2, by2 = damage_bbox
+                cx = ((bx1 + bx2) / 2.0) / crop_w
+                cy = ((by1 + by2) / 2.0) / crop_h
+        elif crop_w > 0 and crop_h > 0:
+            # No mask available — fall back to bounding-box centroid
+            bx1, by1, bx2, by2 = damage_bbox
             cx = ((bx1 + bx2) / 2.0) / crop_w
             cy = ((by1 + by2) / 2.0) / crop_h
-        else:
-            cx, cy = 0.5, 0.5
 
         if damage_type not in self.instances:
             self.instances[damage_type] = []
@@ -578,6 +599,7 @@ class DamageRegistry:
         confidence:   float,
         car_direction: str,
         frame_index:  int,
+        damage_mask:  Optional[np.ndarray] = None,
         damage_bbox:  Tuple[int, int, int, int] = (0, 0, 0, 0),
         crop_size:    Tuple[int, int] = (0, 0),
     ) -> None:
@@ -585,7 +607,11 @@ class DamageRegistry:
 
         Parameters
         ----------
-        damage_bbox : crop-relative bounding box of the individual damage detection
+        damage_mask : crop-relative segmentation mask polygon (int32 ndarray).
+                      Used to compute the mask centroid for instance matching.
+                      When None, falls back to the bbox centroid (legacy path).
+        damage_bbox : crop-relative bounding box — kept as fallback when the
+                      mask is unavailable.
         crop_size   : (width, height) of the part crop
         """
         resolved_part = resolve_side_part_name(part_name, car_direction)
@@ -602,8 +628,9 @@ class DamageRegistry:
             frame_index=frame_index,
             location=location,
             direction=car_direction,
-            damage_bbox=damage_bbox,
+            damage_mask=damage_mask,
             crop_size=crop_size,
+            damage_bbox=damage_bbox,
         )
 
     def mark_part_seen(
@@ -905,8 +932,10 @@ class DamageDetector:
         # Collect ALL valid detections, keeping each box as a candidate instance.
         # Two detections of the same type that are spatially separated on the crop
         # are kept as distinct candidates; the registry will cluster them later.
-        candidates: List[Tuple[str, float, int, Tuple[int,int,int,int]]] = []
-        #            (damage_type, conf, box_idx, crop_bbox)
+        # Each candidate carries its crop-relative mask polygon so the NMS loop
+        # can compare masks directly (mask IoU) rather than bounding boxes.
+        candidates: List[Tuple[str, float, int, Tuple[int,int,int,int], Optional[np.ndarray]]] = []
+        #            (damage_type, conf, box_idx, crop_bbox, mask_pts_crop_relative)
         for idx, box in enumerate(boxes):
             d_cls  = int(box.cls[0])
             d_type = self.model.names[d_cls]
@@ -918,15 +947,23 @@ class DamageDetector:
                 continue
 
             bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-            candidates.append((d_type, d_conf, idx, (bx1, by1, bx2, by2)))
+            # Extract crop-relative mask polygon eagerly so the NMS loop has it.
+            cand_mask: Optional[np.ndarray] = None
+            if masks is not None and idx < len(masks.xy):
+                cand_mask = masks.xy[idx].astype(np.int32)
+            candidates.append((d_type, d_conf, idx, (bx1, by1, bx2, by2), cand_mask))
 
         if not candidates:
             return []
 
-        # Merge heavily-overlapping boxes of the same type (IoU > 0.5) that the
-        # model emits as duplicate detections of the *same* physical damage.
+        # ── Mask IoU helper ───────────────────────────────────────────────────
+        # Merge duplicate detections of the *same* physical damage using pixel-
+        # level mask IoU instead of axis-aligned box IoU.  Two candidates are
+        # considered duplicates when their mask overlap exceeds 50 %.
         # Distinct spatial damages (low IoU) are preserved as separate entries.
-        def _iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
+        # Falls back to box IoU when either candidate has no valid mask.
+        def _box_iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
+            """Axis-aligned bounding-box IoU (fallback when masks are absent)."""
             ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
             ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
             inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
@@ -936,26 +973,66 @@ class DamageDetector:
             area_b = (b[2]-b[0]) * (b[3]-b[1])
             return inter / (area_a + area_b - inter)
 
-        # Sort by descending confidence so we always keep the best box when merging
+        def _mask_iou(
+            pts_a: Optional[np.ndarray],
+            pts_b: Optional[np.ndarray],
+            box_a: Tuple[int,int,int,int],
+            box_b: Tuple[int,int,int,int],
+            crop_shape: Tuple[int, int],
+        ) -> float:
+            """
+            Pixel-level mask IoU computed by rendering both polygon contours
+            into binary images and measuring intersection / union.
+
+            Falls back to box IoU when either mask is missing or degenerate.
+
+            Parameters
+            ----------
+            pts_a, pts_b : crop-relative contour point arrays (int32)
+            box_a, box_b : crop-relative bounding boxes (for the fallback)
+            crop_shape   : (height, width) of the crop image
+            """
+            if (
+                pts_a is None or pts_b is None
+                or pts_a.size < 6 or pts_b.size < 6
+            ):
+                # Not enough points to render a polygon — fall back to box IoU
+                return _box_iou(box_a, box_b)
+
+            h, w = crop_shape
+            if h <= 0 or w <= 0:
+                return _box_iou(box_a, box_b)
+
+            # Render both polygons into binary masks of the same size
+            mask_a = np.zeros((h, w), dtype=np.uint8)
+            mask_b = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask_a, [pts_a], 1)
+            cv2.fillPoly(mask_b, [pts_b], 1)
+
+            inter = int(np.logical_and(mask_a, mask_b).sum())
+            union = int(np.logical_or(mask_a, mask_b).sum())
+            return inter / union if union > 0 else 0.0
+
+        # Sort by descending confidence so we always keep the best detection when merging
         candidates.sort(key=lambda c: c[1], reverse=True)
-        kept_candidates: List[Tuple[str, float, int, Tuple[int,int,int,int]]] = []
+        kept_candidates: List[Tuple[str, float, int, Tuple[int,int,int,int], Optional[np.ndarray]]] = []
+        crop_h_nms, crop_w_nms = crop.shape[:2]
         for cand in candidates:
-            d_type, d_conf, box_idx, cbox = cand
+            d_type, d_conf, box_idx, cbox, cmask = cand
             suppress = False
             for kept in kept_candidates:
-                if kept[0] == d_type and _iou(cbox, kept[3]) > 0.50:
-                    suppress = True   # duplicate box — already have a better one
+                if kept[0] == d_type and _mask_iou(
+                    cmask, kept[4], cbox, kept[3], (crop_h_nms, crop_w_nms)
+                ) > 0.50:
+                    suppress = True   # duplicate mask — already have a better one
                     break
             if not suppress:
                 kept_candidates.append(cand)
 
         # Build the result list — one entry per surviving candidate instance
         dmg_list: List[Tuple[str, float, Optional[np.ndarray], Tuple[int,int,int,int]]] = []
-        for d_type, d_conf, box_idx, cbox in kept_candidates:
-            mask_pts = None
-            if masks is not None and box_idx < len(masks.xy):
-                mask_pts = masks.xy[box_idx].astype(np.int32)
-            dmg_list.append((d_type, d_conf, mask_pts, cbox))
+        for d_type, d_conf, box_idx, cbox, cmask in kept_candidates:
+            dmg_list.append((d_type, d_conf, cmask, cbox))
 
         return dmg_list
 
@@ -1183,11 +1260,32 @@ class CarDamagePipeline:
                     )
                     continue
 
+                # Keep a copy of the crop-relative mask for the registry
+                # (centroid computation via cv2.moments requires crop-relative coords).
+                # d_mask_pts is currently in the coordinate space of the original
+                # part crop (x1, y1); we re-relativise it to the assigned part's
+                # crop origin (ax1, ay1) when re-attribution has occurred.
+                crop_rel_mask: Optional[np.ndarray] = None
+                if d_mask_pts is not None and d_mask_pts.size >= 6:
+                    if assigned_part is not None:
+                        # d_mask_pts is crop-relative to (x1, y1).
+                        # The assigned part crop starts at (ax1, ay1).
+                        # Shift so it is relative to the assigned crop's origin.
+                        ax1_r, ay1_r, _, _ = assigned_part["bbox"]
+                        offset = np.array([ax1_r - x1, ay1_r - y1], dtype=np.int32)
+                        crop_rel_mask = (d_mask_pts - offset).astype(np.int32)
+                    else:
+                        # No re-attribution — mask is already relative to (x1, y1)
+                        crop_rel_mask = d_mask_pts.copy()
+
                 # Translate crop-relative mask coordinates to frame coordinates
+                # (used only for on-screen drawing below).
                 if d_mask_pts is not None:
                     d_mask_pts = (d_mask_pts + np.array([x1, y1])).astype(np.int32)
 
                 # Update the temporal registry with spatial instance tracking.
+                # Pass the crop-relative mask so the registry can compute the
+                # true mask centroid instead of the bounding-box centroid.
                 self.registry.update(
                     track_id=track_id,
                     part_name=target_part_name,
@@ -1195,6 +1293,7 @@ class CarDamagePipeline:
                     confidence=d_conf,
                     car_direction=stable_dir,
                     frame_index=frame_index,
+                    damage_mask=crop_rel_mask,
                     damage_bbox=target_bbox,
                     crop_size=(acrop_w, acrop_h),
                 )
