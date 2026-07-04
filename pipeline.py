@@ -41,14 +41,16 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+BASE_DIR = Path(__file__).resolve().parent
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  CONFIGURATION — edit thresholds here without touching pipeline logic
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Model paths ───────────────────────────────────────────────────────────────
-MODEL_ANGLE_PATH  = "models/best_car_angle.pt"
-MODEL_PARTS_PATH  = "models/best_car_part.pt"
-MODEL_DAMAGE_PATH = "models/best_damage_type.pt"
+MODEL_ANGLE_PATH  = BASE_DIR / "models" / "best_car_angle.pt"
+MODEL_PARTS_PATH  = BASE_DIR / "models" / "best_car_part.pt"
+MODEL_DAMAGE_PATH = BASE_DIR / "models" / "best_damage_type.pt"
 
 # ── Perspective map (camera-view → car-centric) ───────────────────────────────
 # The camera captures a mirror-image of the car's true side.
@@ -211,6 +213,31 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 # ══════════════════════════════════════════════════════════════════════════════
 # 2.  HELPER UTILITIES
 # ══════════════════════════════════════════════════════════════════════════════
+
+def ensure_parent_dir(path: str | Path) -> None:
+    """Create an output file's parent directory when it is explicit."""
+    parent = Path(path).expanduser().parent
+    if str(parent) not in ("", "."):
+        parent.mkdir(parents=True, exist_ok=True)
+
+
+def validate_confidence(name: str, value: float) -> None:
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0.0 and 1.0, got {value}")
+
+
+def validate_runtime_options(
+    parts_conf: float,
+    damage_conf: float,
+    min_votes: int,
+    min_ratio: float,
+) -> None:
+    validate_confidence("parts_conf", parts_conf)
+    validate_confidence("damage_conf", damage_conf)
+    if min_votes < 1:
+        raise ValueError(f"min_votes must be >= 1, got {min_votes}")
+    validate_confidence("min_ratio", min_ratio)
+
 
 def part_color(part_name: str) -> Tuple[int, int, int]:
     """Return a consistent BGR colour for a given part label.
@@ -601,6 +628,7 @@ class DamageRegistry:
         damage_mask:  Optional[np.ndarray] = None,
         damage_bbox:  Tuple[int, int, int, int] = (0, 0, 0, 0),
         crop_size:    Tuple[int, int] = (0, 0),
+        location:     Optional[str] = None,
     ) -> None:
         """Record a single damage observation from one frame.
 
@@ -620,12 +648,12 @@ class DamageRegistry:
                 part_name=resolved_part, track_id=track_id
             )
 
-        location = resolved_part.replace("-", " ").title()
+        display_location = location or resolved_part.replace("-", " ").title()
         self._records[key].add_damage_observation(
             damage_type=damage_type,
             confidence=confidence,
             frame_index=frame_index,
-            location=location,
+            location=display_location,
             direction=car_direction,
             damage_mask=damage_mask,
             crop_size=crop_size,
@@ -790,8 +818,11 @@ class DamageRegistry:
 class DirectionClassifier:
     """Wraps the YOLOv8 classification model for camera-angle prediction."""
 
-    def __init__(self, model_path: str = MODEL_ANGLE_PATH) -> None:
-        self.model = YOLO(model_path)
+    def __init__(self, model_path: str | Path = MODEL_ANGLE_PATH) -> None:
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Direction model not found: {model_path}")
+        self.model = YOLO(str(model_path))
         self._transformer = PerspectiveTransformer()
 
     def predict(self, frame: np.ndarray) -> Tuple[str, str, float]:
@@ -816,8 +847,11 @@ class DirectionClassifier:
 class PartsSegmenter:
     """Wraps the YOLOv8-seg model for car part segmentation."""
 
-    def __init__(self, model_path: str = MODEL_PARTS_PATH) -> None:
-        self.model = YOLO(model_path)
+    def __init__(self, model_path: str | Path = MODEL_PARTS_PATH) -> None:
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Parts model not found: {model_path}")
+        self.model = YOLO(str(model_path))
 
     def predict(
         self,
@@ -874,8 +908,11 @@ class PartsSegmenter:
 class DamageDetector:
     """Wraps the damage detection model and runs it on part crops."""
 
-    def __init__(self, model_path: str = MODEL_DAMAGE_PATH) -> None:
-        self.model = YOLO(model_path)
+    def __init__(self, model_path: str | Path = MODEL_DAMAGE_PATH) -> None:
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Damage model not found: {model_path}")
+        self.model = YOLO(str(model_path))
 
     def predict_on_crop(
         self,
@@ -1061,6 +1098,7 @@ class CarDamagePipeline:
         damage_conf_floor: float = 0.30,
         min_votes:         int   = REGISTRY_MIN_VOTES,
         min_ratio:         float = REGISTRY_MIN_VOTE_RATIO,
+        direction_streak_needed: int = DIRECTION_BUFFER_LEN,
     ) -> None:
         log.info("Loading models …")
         self.direction_clf  = DirectionClassifier(MODEL_ANGLE_PATH)
@@ -1071,7 +1109,7 @@ class CarDamagePipeline:
         self.parts_conf_floor  = parts_conf_floor
         self.damage_conf_floor = damage_conf_floor
 
-        self.dir_buffer = DirectionBuffer()
+        self.dir_buffer = DirectionBuffer(streak_needed=direction_streak_needed)
         self.registry   = DamageRegistry(min_votes=min_votes, min_ratio=min_ratio)
 
         # font config (used by drawing helpers)
@@ -1132,15 +1170,30 @@ class CarDamagePipeline:
             frame, allowed_parts, self.parts_conf_floor
         )
 
-        # Deduplicate: keep only the highest-confidence detection per part name
-        # so that mark_part_seen is called exactly once per part per frame and
-        # the vote denominator stays accurate.
-        best_per_part: Dict[str, Dict] = {}
-        for p in detected_parts:
-            name = p["part_name"]
-            if name not in best_per_part or p["conf"] > best_per_part[name]["conf"]:
-                best_per_part[name] = p
-        detected_parts = list(best_per_part.values())
+        # Deduplicate only near-identical same-class boxes. Keeping one item per
+        # class would drop valid paired parts such as headlights, tail-lights,
+        # and wheels.
+        def _bbox_iou(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
+            ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+            ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            if inter == 0:
+                return 0.0
+            area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+            area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+            denom = area_a + area_b - inter
+            return inter / denom if denom > 0 else 0.0
+
+        filtered_parts: List[Dict] = []
+        for part in sorted(detected_parts, key=lambda p: p["conf"], reverse=True):
+            duplicate = any(
+                part["part_name"] == kept["part_name"]
+                and _bbox_iou(part["bbox"], kept["bbox"]) > 0.85
+                for kept in filtered_parts
+            )
+            if not duplicate:
+                filtered_parts.append(part)
+        detected_parts = filtered_parts
 
         drawings: List[Dict] = []
 
@@ -1148,6 +1201,14 @@ class CarDamagePipeline:
             part_name  = part_info["part_name"]
             part_conf  = part_info["conf"]
             x1, y1, x2, y2 = part_info["bbox"]
+            frame_h, frame_w = frame.shape[:2]
+            x1 = max(0, min(frame_w, x1))
+            x2 = max(0, min(frame_w, x2))
+            y1 = max(0, min(frame_h, y1))
+            y2 = max(0, min(frame_h, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            part_info["bbox"] = (x1, y1, x2, y2)
             mask_pts   = part_info["mask_pts"]
             color      = part_color(part_name)
 
@@ -1206,8 +1267,10 @@ class CarDamagePipeline:
                             best_dist = dist
                             assigned_part = p_info
 
-                # If the best matching part is too far (e.g. more than 15px outside any part), skip it
-                if best_dist < -15.0:
+                # If masks were available and the best matching part is too far
+                # outside every part, skip it. When masks are absent, fall back
+                # to the current crop instead of dropping all detections.
+                if assigned_part is not None and best_dist < -15.0:
                     continue
 
                 # If we successfully matched to a part, use its info
@@ -1279,6 +1342,7 @@ class CarDamagePipeline:
                     damage_mask=crop_rel_mask,
                     damage_bbox=target_bbox,
                     crop_size=(acrop_w, acrop_h),
+                    location=target_location,
                 )
 
                 drawings.append({
@@ -1389,6 +1453,10 @@ def run_video(
     Writes two annotated output videos (_parts, _damage) and optionally
     saves a JSON damage report with the finalized registry output.
     """
+    validate_runtime_options(parts_conf, damage_conf, min_votes, min_ratio)
+    if frame_skip < 1:
+        raise ValueError(f"frame_skip must be >= 1, got {frame_skip}")
+
     log.info("=" * 65)
     log.info("Car Damage Detection — Integrated 3-Model Pipeline")
     log.info("Input  : %s", video_path)
@@ -1424,6 +1492,7 @@ def run_video(
 
     writer_parts: Optional[cv2.VideoWriter] = None
     if save_parts:
+        ensure_parent_dir(f"{base}_parts.mp4")
         writer_parts = cv2.VideoWriter(
             f"{base}_parts.mp4", fourcc, out_fps, (width, height)
         )
@@ -1433,6 +1502,7 @@ def run_video(
 
     writer_damage: Optional[cv2.VideoWriter] = None
     if save_damage:
+        ensure_parent_dir(f"{base}_damage.mp4")
         writer_damage = cv2.VideoWriter(
             f"{base}_damage.mp4", fourcc, out_fps, (width, height)
         )
@@ -1440,7 +1510,8 @@ def run_video(
             log.warning("VideoWriter for damage could not be opened — damage video will be skipped.")
             writer_damage = None
 
-    frame_idx = written = 0
+    frame_idx = written = error_count = 0
+    max_frame_errors = 10
     t0 = time.time()
 
     try:
@@ -1463,7 +1534,13 @@ def run_video(
                     frame, frame_index=frame_idx, track_id=0
                 )
             except Exception as exc:  # noqa: BLE001
-                log.warning("Frame %d skipped due to error: %s", frame_idx, exc)
+                error_count += 1
+                log.exception("Frame %d failed during pipeline processing.", frame_idx)
+                if error_count >= max_frame_errors:
+                    raise RuntimeError(
+                        f"Aborting after {error_count} frame processing errors. "
+                        "Check model compatibility and input video quality."
+                    ) from exc
                 continue
 
             _draw_hud(parts_frm,  frame_idx, total_frames, live_fps, stable_dir, "PARTS")
@@ -1491,6 +1568,12 @@ def run_video(
 
     # ── Damage Report ─────────────────────────────────────────────────────────
     log.info("Processed %d frames in %.1fs", written, time.time() - t0)
+    if written == 0:
+        if error_count > 0:
+            raise RuntimeError(
+                f"No frames were processed successfully; {error_count} frame errors occurred."
+            )
+        raise RuntimeError("No frames were processed. Check frame_skip and the input video.")
 
     if debug:
         print(pipeline.registry.debug_registry())
@@ -1502,6 +1585,7 @@ def run_video(
     print(DamageRegistry.format_report(report))
 
     if report_path:
+        ensure_parent_dir(report_path)
         Path(report_path).write_text(json.dumps(report, indent=2))
         log.info("Report saved → %s", report_path)
 
@@ -1538,6 +1622,8 @@ def run_image(
       voting only makes sense across multiple frames.
     • Output is two annotated images (_parts / _damage) instead of videos.
     """
+    validate_runtime_options(parts_conf, damage_conf, min_votes=1, min_ratio=0.0)
+
     log.info("=" * 65)
     log.info("Car Damage Detection — Image Mode")
     log.info("Input  : %s", image_path)
@@ -1562,6 +1648,7 @@ def run_image(
         damage_conf_floor=damage_conf,
         min_votes=1,
         min_ratio=0.0,
+        direction_streak_needed=1,
     )
 
     parts_frm, damage_frm, stable_dir = pipeline.process_frame(
@@ -1589,12 +1676,17 @@ def run_image(
     parts_out  = f"{base}_parts{ext}"
     damage_out = f"{base}_damage{ext}"
 
-    cv2.imwrite(parts_out,  parts_frm)
-    cv2.imwrite(damage_out, damage_frm)
+    ensure_parent_dir(parts_out)
+    ensure_parent_dir(damage_out)
+    if not cv2.imwrite(parts_out, parts_frm):
+        raise RuntimeError(f"Failed to write parts image: {parts_out}")
+    if not cv2.imwrite(damage_out, damage_frm):
+        raise RuntimeError(f"Failed to write damage image: {damage_out}")
     log.info("Parts image  → %s", parts_out)
     log.info("Damage image → %s", damage_out)
 
     if report_path:
+        ensure_parent_dir(report_path)
         Path(report_path).write_text(json.dumps(report, indent=2))
         log.info("Report saved → %s", report_path)
 
