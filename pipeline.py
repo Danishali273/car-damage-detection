@@ -48,7 +48,7 @@ from ultralytics import YOLO
 # ── Model paths ───────────────────────────────────────────────────────────────
 MODEL_ANGLE_PATH  = "models/best_car_angle.pt"
 MODEL_PARTS_PATH  = "models/best_car_part.pt"
-MODEL_DAMAGE_PATH = "models/best.pt"
+MODEL_DAMAGE_PATH = "models/best_damage_type.pt"
 
 # ── Perspective map (camera-view → car-centric) ───────────────────────────────
 # The camera captures a mirror-image of the car's true side.
@@ -165,7 +165,6 @@ INSTANCE_MATCH_RADIUS = 0.30
 # ── Overlapping direction groups (for cross-view deduplication) ───────────────
 # Directions within the same group share physical overlap, so the same scratch
 # on a fender can appear in both "front-right-side" and "right-side" views.
-# deduplicate_report() uses this table to keep only the highest-confidence      
 # entry when the same (part, damage_type) is detected from two overlapping angles.
 DIRECTION_OVERLAP_GROUPS: List[Set[str]] = [
     {"front-right-side", "right-side", "front"},
@@ -783,22 +782,6 @@ class DamageRegistry:
         lines.append("=" * 133)
         return "\n".join(lines)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 7.  CROSS-VIEW DEDUPLICATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _directions_overlap(d1: str, d2: str) -> bool:
-    """Return True if d1 and d2 belong to the same physical overlap group.
-
-    Two directions are considered overlapping when they are co-members of a
-    single entry in ``DIRECTION_OVERLAP_GROUPS`` — meaning a camera shot from
-    either angle can physically capture the same panel location.
-    """
-    for group in DIRECTION_OVERLAP_GROUPS:
-        if d1 in group and d2 in group:
-            return True
-    return False
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 8.  MODEL WRAPPERS
@@ -899,7 +882,7 @@ class DamageDetector:
         crop: np.ndarray,
         allowed_damages: List[str],
         conf_floor: float = 0.30,
-    ) -> List[Tuple[str, float, Optional[np.ndarray]]]:
+    ) -> List[Tuple[str, float, Optional[np.ndarray], Tuple[int, int, int, int]]]:
         """
         Run damage detection on a single part crop.
 
