@@ -164,6 +164,23 @@ REGISTRY_MIN_VOTE_RATIO = 0.15  # damage seen in >= 15% of frames it was observa
 DIRECTION_BUFFER_LEN    = 3    # consecutive frames needed to commit to a new direction
 INSTANCE_MATCH_RADIUS = 0.30
 
+# ── Severity classification thresholds ────────────────────────────────────────
+# severity_ratio = damage_mask_area / part_mask_area
+# Thresholds are checked in order; first match wins.
+SEVERITY_THRESHOLDS: List[Tuple[float, str]] = [
+    (0.05, "Minor"),     # 0 %  –  5 %
+    (0.20, "Moderate"),  # 5 %  – 20 %
+    (1.00, "Severe"),    # 20 % +
+]
+
+
+def classify_severity(ratio: float) -> str:
+    """Map a damage-area / part-area ratio to a human-readable severity label."""
+    for threshold, label in SEVERITY_THRESHOLDS:
+        if ratio <= threshold:
+            return label
+    return "Severe"  # anything above 100 % (shouldn't happen, but safe fallback)
+
 # ── Overlapping direction groups (for cross-view deduplication) ───────────────
 # Directions within the same group share physical overlap, so the same scratch
 # on a fender can appear in both "front-right-side" and "right-side" views.
@@ -425,6 +442,9 @@ class DamageInstance:
     frames_seen    : set of frame indices (prevents double-counting)
     location       : human-readable compound label (most-voted)
     votes_per_direction: map from camera direction string to vote count
+    best_damage_area_px : largest damage mask pixel area seen (for severity)
+    best_part_area_px   : part mask pixel area from the frame where
+                          best_damage_area_px was recorded
     """
     damage_type: str
     vote_count:  int = 0
@@ -434,8 +454,20 @@ class DamageInstance:
     frames_seen: Set[int] = field(default_factory=set)
     _loc_votes:  Dict[str, int] = field(default_factory=dict)
     votes_per_direction: Dict[str, int] = field(default_factory=dict)
+    best_damage_area_px: float = 0.0
+    best_part_area_px:   float = 0.0
 
-    def update(self, conf: float, cx: float, cy: float, frame_index: int, location: str, direction: str) -> None:
+    def update(
+        self,
+        conf: float,
+        cx: float,
+        cy: float,
+        frame_index: int,
+        location: str,
+        direction: str,
+        damage_area_px: float = 0.0,
+        part_area_px: float = 0.0,
+    ) -> None:
         """Absorb a new observation into this instance."""
         if frame_index in self.frames_seen:
             # Already counted this frame — only update confidence if higher
@@ -452,6 +484,24 @@ class DamageInstance:
         self.cy_norm += (cy - self.cy_norm) / n
         self._loc_votes[location] = self._loc_votes.get(location, 0) + 1
         self.votes_per_direction[direction] = self.votes_per_direction.get(direction, 0) + 1
+        # Track the largest observed damage area for severity calculation.
+        # Using the max keeps the most "visible" observation — typically
+        # the frame where the camera was closest / most perpendicular.
+        if damage_area_px > self.best_damage_area_px:
+            self.best_damage_area_px = damage_area_px
+            self.best_part_area_px   = part_area_px
+
+    @property
+    def severity_ratio(self) -> float:
+        """Ratio of damage area to part area (0.0 when area data is unavailable)."""
+        if self.best_part_area_px > 0:
+            return self.best_damage_area_px / self.best_part_area_px
+        return 0.0
+
+    @property
+    def severity(self) -> str:
+        """Human-readable severity label derived from severity_ratio."""
+        return classify_severity(self.severity_ratio)
 
     @property
     def best_location(self) -> str:
@@ -502,6 +552,7 @@ class PartRecord:
         crop_size: Tuple[int, int],
         damage_bbox: Tuple[int, int, int, int] = (0, 0, 0, 0),
         match_radius: float = INSTANCE_MATCH_RADIUS,
+        part_area_px: float = 0.0,
     ) -> None:
         """
         Record a damage observation of a given type, clustering spatially.
@@ -517,6 +568,11 @@ class PartRecord:
 
         crop_w, crop_h = crop_size
         cx, cy = 0.5, 0.5  # safe defaults
+
+        # ── Compute damage mask area (pixels) for severity ────────────────
+        damage_area_px = 0.0
+        if damage_mask is not None and damage_mask.size >= 6:
+            damage_area_px = float(cv2.contourArea(damage_mask.astype(np.float32)))
 
         if damage_mask is not None and damage_mask.size >= 6:
             # Compute the true geometric centroid of the segmentation mask using
@@ -537,6 +593,11 @@ class PartRecord:
             bx1, by1, bx2, by2 = damage_bbox
             cx = ((bx1 + bx2) / 2.0) / crop_w
             cy = ((by1 + by2) / 2.0) / crop_h
+
+        # When no mask is available, approximate damage area from bbox
+        if damage_area_px == 0.0:
+            bx1, by1, bx2, by2 = damage_bbox
+            damage_area_px = float(max(0, bx2 - bx1) * max(0, by2 - by1))
 
         if damage_type not in self.instances:
             self.instances[damage_type] = []
@@ -565,10 +626,12 @@ class PartRecord:
                 best_inst = inst
 
         if best_inst is not None and best_dist <= match_radius:
-            best_inst.update(confidence, cx, cy, frame_index, location, direction)
+            best_inst.update(confidence, cx, cy, frame_index, location, direction,
+                            damage_area_px=damage_area_px, part_area_px=part_area_px)
         else:
             new_inst = DamageInstance(damage_type=damage_type)
-            new_inst.update(confidence, cx, cy, frame_index, location, direction)
+            new_inst.update(confidence, cx, cy, frame_index, location, direction,
+                           damage_area_px=damage_area_px, part_area_px=part_area_px)
             existing_list.append(new_inst)
 
     def confirmed_instances(
@@ -629,6 +692,7 @@ class DamageRegistry:
         damage_bbox:  Tuple[int, int, int, int] = (0, 0, 0, 0),
         crop_size:    Tuple[int, int] = (0, 0),
         location:     Optional[str] = None,
+        part_area_px: float = 0.0,
     ) -> None:
         """Record a single damage observation from one frame.
 
@@ -640,6 +704,7 @@ class DamageRegistry:
         damage_bbox : crop-relative bounding box — kept as fallback when the
                       mask is unavailable.
         crop_size   : (width, height) of the part crop
+        part_area_px : pixel area of the part's segmentation mask (for severity)
         """
         resolved_part = resolve_side_part_name(part_name, car_direction)
         key = (track_id, resolved_part)
@@ -658,6 +723,7 @@ class DamageRegistry:
             damage_mask=damage_mask,
             crop_size=crop_size,
             damage_bbox=damage_bbox,
+            part_area_px=part_area_px,
         )
 
     def mark_part_seen(
@@ -694,6 +760,8 @@ class DamageRegistry:
                     "location":     inst.best_location or part_name.replace("-", " ").title(),
                     "damage_type":  inst.damage_type,
                     "confidence":   round(inst.best_conf, 4),
+                    "severity":     inst.severity,
+                    "severity_ratio": round(inst.severity_ratio, 4),
                 })
 
         return report
@@ -705,14 +773,17 @@ class DamageRegistry:
         """
         if not report:
             return "No confirmed damage detected."
-        lines = ["=" * 56, "  DAMAGE REPORT", "=" * 56]
+        lines = ["=" * 76, "  DAMAGE REPORT", "=" * 76]
         for item in report:
+            sev = item.get('severity', 'N/A')
+            sev_ratio = item.get('severity_ratio', 0.0)
             lines.append(
-                f"  {item['location']:<32}  "
+                f"  {item['location']:<30}  "
                 f"{item['damage_type']:<14}  "
-                f"conf={item['confidence']:.2f}"
+                f"conf={item['confidence']:.2f}  "
+                f"severity={sev:<8} ({sev_ratio:.1%})"
             )
-        lines.append("=" * 56)
+        lines.append("=" * 76)
         return "\n".join(lines)
 
     def summary(self) -> str:
@@ -740,6 +811,7 @@ class DamageRegistry:
             f"{'Votes':<5}",
             f"{'Seen':<5}",
             f"{'Centroid':<14}",
+            f"{'Severity':<18}",
             f"{'Per-Direction Ratios (Votes/Seen)':<45}",
             f"{'Verdict':<9}"
         ]
@@ -751,6 +823,7 @@ class DamageRegistry:
             "-" * 5,
             "-" * 5,
             "-" * 14,
+            "-" * 18,
             "-" * 45,
             "-" * 9
         ]
@@ -759,9 +832,9 @@ class DamageRegistry:
         separator = "  " + "-+-".join(border_parts)
         
         lines = [
-            "=" * 133,
+            "=" * 155,
             "  DEBUG — RAW REGISTRY STATE (BEFORE VOTING)",
-            "=" * 133,
+            "=" * 155,
             header,
             separator
         ]
@@ -780,7 +853,7 @@ class DamageRegistry:
                 seen_dirs = [f"{d}:{len(f)}" for d, f in sorted(record._seen_frames_per_dir.items())]
                 seen_txt = f"No damage; seen in: {', '.join(seen_dirs)}"
                 lines.append(
-                    f"  {track_id:<5} | {part_name:<22} | {'-':<12} | {'-':<5} | {total_part_seen:<5} | {'-':<14} | {seen_txt:<45} | {'-':<9}"
+                    f"  {track_id:<5} | {part_name:<22} | {'-':<12} | {'-':<5} | {total_part_seen:<5} | {'-':<14} | {'-':<18} | {seen_txt:<45} | {'-':<9}"
                 )
             else:
                 # Sort by damage type then descending vote count
@@ -802,12 +875,13 @@ class DamageRegistry:
                     dir_txt = ", ".join(dir_strings)
                     centroid_txt = f"({inst.cx_norm:.2f}, {inst.cy_norm:.2f})"
                     verdict = "CONFIRMED" if confirmed else "FAIL"
+                    sev_txt = f"{inst.severity} ({inst.severity_ratio:.1%})"
                     
                     lines.append(
-                        f"  {track_id:<5} | {part_name:<22} | {inst.damage_type:<12} | {inst.vote_count:<5} | {total_part_seen:<5} | {centroid_txt:<14} | {dir_txt:<45} | {verdict:<9}"
+                        f"  {track_id:<5} | {part_name:<22} | {inst.damage_type:<12} | {inst.vote_count:<5} | {total_part_seen:<5} | {centroid_txt:<14} | {sev_txt:<18} | {dir_txt:<45} | {verdict:<9}"
                     )
 
-        lines.append("=" * 133)
+        lines.append("=" * 155)
         return "\n".join(lines)
 
 
@@ -1212,6 +1286,13 @@ class CarDamagePipeline:
             mask_pts   = part_info["mask_pts"]
             color      = part_color(part_name)
 
+            # Compute part mask area in pixels (for severity ratio denominator).
+            # Falls back to bounding-box area when the mask polygon is unavailable.
+            if mask_pts is not None and mask_pts.size >= 6:
+                part_info["part_area_px"] = float(cv2.contourArea(mask_pts.astype(np.float32)))
+            else:
+                part_info["part_area_px"] = float((x2 - x1) * (y2 - y1))
+
             # Mark that this part was visible (for ratio denominator).
             # stable_dir is passed so the counter is tracked per (part, direction)
             # key — keeping the vote denominator accurate for each directional view.
@@ -1283,6 +1364,7 @@ class CarDamagePipeline:
                     acrop_h = ay2 - ay1
                     # Translate damage bbox to be relative to the assigned part's crop
                     target_bbox = (dx1 - ax1, dy1 - ay1, dx2 - ax1, dy2 - ay1)
+                    target_part_area_px = assigned_part.get("part_area_px", 0.0)
                 else:
                     # Fallback to the current crop's part
                     target_part_name = part_name
@@ -1291,6 +1373,7 @@ class CarDamagePipeline:
                     acrop_w = crop_w
                     acrop_h = crop_h
                     target_bbox = d_bbox
+                    target_part_area_px = part_info.get("part_area_px", 0.0)
 
                 # Re-attribution guard: after changing the owning part, verify
                 # that d_type is still physically valid for that part.
@@ -1343,6 +1426,7 @@ class CarDamagePipeline:
                     damage_bbox=target_bbox,
                     crop_size=(acrop_w, acrop_h),
                     location=target_location,
+                    part_area_px=target_part_area_px,
                 )
 
                 drawings.append({
