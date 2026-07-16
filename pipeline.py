@@ -159,10 +159,57 @@ PART_DAMAGE_MAP: Dict[str, List[str]] = {
 _BODY_PANEL_DEFAULT = ["dent", "scratch", "crack"]
 
 # ── DamageRegistry voting parameters ─────────────────────────────────────────
-REGISTRY_MIN_VOTES      = 3   # minimum frames a damage must appear to be "confirmed"
-REGISTRY_MIN_VOTE_RATIO = 0.15  # damage seen in >= 15% of frames it was observable
-DIRECTION_BUFFER_LEN    = 3    # consecutive frames needed to commit to a new direction
-INSTANCE_MATCH_RADIUS = 0.30
+# All temporal thresholds are expressed in SECONDS — FPS-agnostic by design.
+# compute_adaptive_thresholds() converts them to frame counts at runtime.
+REGISTRY_MIN_VOTE_SECONDS = 0.20  # damage must be visible for >= 0.20 s to be confirmed
+REGISTRY_MIN_VOTE_RATIO   = 0.15  # damage seen in >= 15 % of frames it was observable
+DIRECTION_BUFFER_SECONDS  = 0.10  # consecutive seconds required to commit a new direction
+INSTANCE_MATCH_RADIUS     = 0.30
+
+
+def compute_adaptive_thresholds(fps: float) -> dict:
+    """
+    Convert time-based threshold constants into frame counts for a given FPS.
+
+    This makes the temporal voting logic FPS-agnostic:
+      • At 15 FPS  →  min_votes = 3,  direction_streak = 2
+      • At 30 FPS  →  min_votes = 6,  direction_streak = 3
+      • At 60 FPS  →  min_votes = 12, direction_streak = 6
+
+    Parameters
+    ----------
+    fps : Effective frames-per-second of the processed stream (src_fps / frame_skip).
+          Must be > 0; raises ValueError otherwise.
+
+    Returns
+    -------
+    dict with keys:
+        min_votes        – minimum frame-vote count to confirm a damage
+        min_ratio        – minimum vote / frames-seen ratio (unchanged)
+        direction_streak – consecutive frames required for a direction commit
+    """
+    if fps <= 0:
+        raise ValueError(
+            f"compute_adaptive_thresholds: fps must be > 0, got {fps}. "
+            "Check that the video file reports a valid frame rate."
+        )
+
+    min_votes        = max(1, round(fps * REGISTRY_MIN_VOTE_SECONDS))
+    direction_streak = max(1, round(fps * DIRECTION_BUFFER_SECONDS))
+
+    log.info(
+        "Adaptive thresholds @ %.1f FPS → min_votes=%d (%.2fs)  "
+        "direction_streak=%d (%.2fs)  min_ratio=%.0f%%",
+        fps,
+        min_votes,        REGISTRY_MIN_VOTE_SECONDS,
+        direction_streak, DIRECTION_BUFFER_SECONDS,
+        REGISTRY_MIN_VOTE_RATIO * 100,
+    )
+    return {
+        "min_votes":        min_votes,
+        "min_ratio":        REGISTRY_MIN_VOTE_RATIO,
+        "direction_streak": direction_streak,
+    }
 
 # ── Severity classification thresholds ────────────────────────────────────────
 # severity_ratio = damage_mask_area / part_mask_area
@@ -246,14 +293,10 @@ def validate_confidence(name: str, value: float) -> None:
 def validate_runtime_options(
     parts_conf: float,
     damage_conf: float,
-    min_votes: int,
-    min_ratio: float,
 ) -> None:
+    """Validate only the model confidence floors — voting thresholds are adaptive."""
     validate_confidence("parts_conf", parts_conf)
     validate_confidence("damage_conf", damage_conf)
-    if min_votes < 1:
-        raise ValueError(f"min_votes must be >= 1, got {min_votes}")
-    validate_confidence("min_ratio", min_ratio)
 
 
 def part_color(part_name: str) -> Tuple[int, int, int]:
@@ -340,7 +383,7 @@ class DirectionBuffer:
 
     def __init__(
         self,
-        streak_needed: int = DIRECTION_BUFFER_LEN,
+        streak_needed: int = 3,
     ) -> None:
         self._streak_needed = streak_needed
         # Current pending direction and how many consecutive frames it has held
@@ -484,18 +527,20 @@ class DamageInstance:
         self.cy_norm += (cy - self.cy_norm) / n
         self._loc_votes[location] = self._loc_votes.get(location, 0) + 1
         self.votes_per_direction[direction] = self.votes_per_direction.get(direction, 0) + 1
-        # Track the largest observed damage area for severity calculation.
-        # Using the max keeps the most "visible" observation — typically
-        # the frame where the camera was closest / most perpendicular.
+        # Track the largest observed damage area and largest observed part
+        # area INDEPENDENTLY.  Using max(damage) / max(part) keeps the ratio
+        # bounded (≤ 1.0) because the largest part view is always at least as
+        # large as the largest damage view on that same part.
         if damage_area_px > self.best_damage_area_px:
             self.best_damage_area_px = damage_area_px
-            self.best_part_area_px   = part_area_px
+        if part_area_px > self.best_part_area_px:
+            self.best_part_area_px = part_area_px
 
     @property
     def severity_ratio(self) -> float:
-        """Ratio of damage area to part area (0.0 when area data is unavailable)."""
+        """Ratio of damage area to part area, clamped to [0.0, 1.0]."""
         if self.best_part_area_px > 0:
-            return self.best_damage_area_px / self.best_part_area_px
+            return min(self.best_damage_area_px / self.best_part_area_px, 1.0)
         return 0.0
 
     @property
@@ -526,6 +571,10 @@ class PartRecord:
     # damage_type → list of DamageInstance clusters
     instances:    Dict[str, List[DamageInstance]] = field(default_factory=dict)
     _seen_frames_per_dir: Dict[str, Set[int]] = field(default_factory=dict)
+    # Max part mask area observed across ALL frames and ALL camera angles.
+    # Used as the severity denominator so the ratio reflects the most
+    # complete view of the part, not just the angle where damage was found.
+    max_part_area_px: float = 0.0
 
     @property
     def total_frames_seen(self) -> int:
@@ -535,11 +584,13 @@ class PartRecord:
             union_frames.update(f_set)
         return len(union_frames)
 
-    def mark_seen(self, frame_index: int, direction: str) -> None:
+    def mark_seen(self, frame_index: int, direction: str, part_area_px: float = 0.0) -> None:
         """Record that this part was visible on a given frame under a specific direction."""
         if direction not in self._seen_frames_per_dir:
             self._seen_frames_per_dir[direction] = set()
         self._seen_frames_per_dir[direction].add(frame_index)
+        if part_area_px > self.max_part_area_px:
+            self.max_part_area_px = part_area_px
 
     def add_damage_observation(
         self,
@@ -565,6 +616,8 @@ class PartRecord:
         if direction not in self._seen_frames_per_dir:
             self._seen_frames_per_dir[direction] = set()
         self._seen_frames_per_dir[direction].add(frame_index)
+        if part_area_px > self.max_part_area_px:
+            self.max_part_area_px = part_area_px
 
         crop_w, crop_h = crop_size
         cx, cy = 0.5, 0.5  # safe defaults
@@ -636,8 +689,8 @@ class PartRecord:
 
     def confirmed_instances(
         self,
-        min_votes: int   = REGISTRY_MIN_VOTES,
-        min_ratio: float = REGISTRY_MIN_VOTE_RATIO,
+        min_votes: int   = 3,
+        min_ratio: float = 0.15,
     ) -> List[DamageInstance]:
         """
         Return all damage instances that pass the vote thresholds.
@@ -645,6 +698,12 @@ class PartRecord:
         An instance is confirmed if in at least one camera direction:
           1. vote_count in direction >= min_votes
           2. vote_count in direction / total frames seen in that direction >= min_ratio
+
+        Before returning, each confirmed instance's best_part_area_px is
+        upgraded to the PartRecord's max_part_area_px (the largest part
+        area observed across ALL frames and ALL camera angles).  This
+        ensures the severity denominator reflects the most complete view
+        of the part, not just the angle where damage happened to be detected.
         """
         result: List[DamageInstance] = []
         for inst_list in self.instances.values():
@@ -658,6 +717,9 @@ class PartRecord:
                             confirmed = True
                             break
                 if confirmed:
+                    # Use the max part area across all angles for severity
+                    if self.max_part_area_px > inst.best_part_area_px:
+                        inst.best_part_area_px = self.max_part_area_px
                     result.append(inst)
         return result
 
@@ -671,8 +733,8 @@ class DamageRegistry:
 
     def __init__(
         self,
-        min_votes: int  = REGISTRY_MIN_VOTES,
-        min_ratio: float = REGISTRY_MIN_VOTE_RATIO,
+        min_votes: int   = 3,
+        min_ratio: float = 0.15,
     ) -> None:
         self._min_votes = min_votes
         self._min_ratio = min_ratio
@@ -732,10 +794,12 @@ class DamageRegistry:
         part_name:     str,
         car_direction: str,
         frame_index:   int,
+        part_area_px:  float = 0.0,
     ) -> None:
         """
         Track that a part was visible on a given frame, even when no damage
-        is detected on that frame.
+        is detected on that frame.  Also tracks the max part area across
+        all frames for accurate severity computation.
         """
         resolved_part = resolve_side_part_name(part_name, car_direction)
         key = (track_id, resolved_part)
@@ -743,7 +807,7 @@ class DamageRegistry:
             self._records[key] = PartRecord(
                 part_name=resolved_part, track_id=track_id
             )
-        self._records[key].mark_seen(frame_index, car_direction)
+        self._records[key].mark_seen(frame_index, car_direction, part_area_px=part_area_px)
 
     # ------------------------------------------------------------------
     def finalize(self) -> List[Dict]:
@@ -1170,10 +1234,18 @@ class CarDamagePipeline:
         self,
         parts_conf_floor:  float = 0.30,
         damage_conf_floor: float = 0.30,
-        min_votes:         int   = REGISTRY_MIN_VOTES,
-        min_ratio:         float = REGISTRY_MIN_VOTE_RATIO,
-        direction_streak_needed: int = DIRECTION_BUFFER_LEN,
+        fps:               float = 25.0,
     ) -> None:
+        """
+        Parameters
+        ----------
+        parts_conf_floor  : Minimum model confidence to accept a part detection.
+        damage_conf_floor : Minimum model confidence to accept a damage detection.
+        fps               : Effective frames-per-second of the processed stream
+                            (src_fps / frame_skip).  All temporal thresholds
+                            (min_votes, direction_streak) are computed from this
+                            value via compute_adaptive_thresholds().
+        """
         log.info("Loading models …")
         self.direction_clf  = DirectionClassifier(MODEL_ANGLE_PATH)
         self.parts_seg      = PartsSegmenter(MODEL_PARTS_PATH)
@@ -1183,8 +1255,13 @@ class CarDamagePipeline:
         self.parts_conf_floor  = parts_conf_floor
         self.damage_conf_floor = damage_conf_floor
 
-        self.dir_buffer = DirectionBuffer(streak_needed=direction_streak_needed)
-        self.registry   = DamageRegistry(min_votes=min_votes, min_ratio=min_ratio)
+        # ── Adaptive temporal thresholds (always derived from FPS) ────────
+        adaptive = compute_adaptive_thresholds(fps)
+        self.dir_buffer = DirectionBuffer(streak_needed=adaptive["direction_streak"])
+        self.registry   = DamageRegistry(
+            min_votes=adaptive["min_votes"],
+            min_ratio=adaptive["min_ratio"],
+        )
 
         # font config (used by drawing helpers)
         self._font      = cv2.FONT_HERSHEY_SIMPLEX
@@ -1296,7 +1373,8 @@ class CarDamagePipeline:
             # Mark that this part was visible (for ratio denominator).
             # stable_dir is passed so the counter is tracked per (part, direction)
             # key — keeping the vote denominator accurate for each directional view.
-            self.registry.mark_part_seen(track_id, part_name, stable_dir, frame_index)
+            self.registry.mark_part_seen(track_id, part_name, stable_dir, frame_index,
+                                          part_area_px=part_info["part_area_px"])
 
             # Draw segmentation on parts frame
             if mask_pts is not None and mask_pts.size > 0:
@@ -1518,26 +1596,27 @@ def _draw_hud(
 
 
 def run_video(
-    video_path:        str,
-    output_path:       str   = "result_pipeline.mp4",
-    parts_conf:        float = 0.30,
-    damage_conf:       float = 0.30,
-    frame_skip:        int   = 1,
-    preview:           bool  = False,
-    save_parts:        bool  = True,
-    save_damage:       bool  = True,
-    report_path:       Optional[str] = None,
-    min_votes:         int   = REGISTRY_MIN_VOTES,
-    min_ratio:         float = REGISTRY_MIN_VOTE_RATIO,
-    debug:             bool  = False,
+    video_path:   str,
+    output_path:  str  = "result_pipeline.mp4",
+    parts_conf:   float = 0.30,
+    damage_conf:  float = 0.30,
+    frame_skip:   int   = 1,
+    preview:      bool  = False,
+    save_parts:   bool  = True,
+    save_damage:  bool  = True,
+    report_path:  Optional[str] = None,
+    debug:        bool  = False,
 ) -> None:
     """
     Full end-to-end pipeline runner for a video file.
 
     Writes two annotated output videos (_parts, _damage) and optionally
     saves a JSON damage report with the finalized registry output.
+
+    Temporal voting thresholds (min_votes, direction_streak) are derived
+    automatically from the video's FPS via compute_adaptive_thresholds().
     """
-    validate_runtime_options(parts_conf, damage_conf, min_votes, min_ratio)
+    validate_runtime_options(parts_conf, damage_conf)
     if frame_skip < 1:
         raise ValueError(f"frame_skip must be >= 1, got {frame_skip}")
 
@@ -1546,18 +1625,8 @@ def run_video(
     log.info("Input  : %s", video_path)
     log.info("Output : %s", output_path)
     log.info("=" * 65)
-    log.info(
-        "Thresholds : votes>=%d  ratio>=%.0f%%  dir_buffer=%d",
-        min_votes, min_ratio * 100, DIRECTION_BUFFER_LEN,
-    )
 
-    pipeline = CarDamagePipeline(
-        parts_conf_floor=parts_conf,
-        damage_conf_floor=damage_conf,
-        min_votes=min_votes,
-        min_ratio=min_ratio,
-    )
-
+    # ── Read video metadata FIRST so adaptive thresholds can use real FPS ─
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
@@ -1566,9 +1635,20 @@ def run_video(
     src_fps      = cap.get(cv2.CAP_PROP_FPS) or 25.0
     width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out_fps      = src_fps / frame_skip
+    # Effective FPS after frame-skipping: vote windows stay calibrated
+    # at the rate frames are actually processed, not the raw capture rate.
+    effective_fps = src_fps / frame_skip
+    out_fps       = effective_fps
 
-    log.info("Resolution : %dx%d   FPS: %.1f → %.1f", width, height, src_fps, out_fps)
+    log.info("Resolution : %dx%d   FPS: %.1f → %.1f (effective)",
+             width, height, src_fps, effective_fps)
+
+    # ── Build pipeline — all temporal thresholds auto-derived from FPS ────
+    pipeline = CarDamagePipeline(
+        parts_conf_floor=parts_conf,
+        damage_conf_floor=damage_conf,
+        fps=effective_fps,
+    )
     log.info("Frames     : %d  (every %d)", total_frames, frame_skip)
 
     base   = os.path.splitext(output_path)[0]
@@ -1817,10 +1897,6 @@ Examples — Image:
                     help="[Video only] Skip parts output video")
     ap.add_argument("--no-damage",   action="store_true",
                     help="[Video only] Skip damage output video")
-    ap.add_argument("--min-votes",   type=int, default=REGISTRY_MIN_VOTES,
-                    help=f"[Video only] Min frames to confirm damage (default: {REGISTRY_MIN_VOTES})")
-    ap.add_argument("--min-ratio",   type=float, default=REGISTRY_MIN_VOTE_RATIO,
-                    help=f"[Video only] Min frame ratio to confirm damage (default: {REGISTRY_MIN_VOTE_RATIO})")
     # ── Shared flags ───────────────────────────────────────────────────────────
     ap.add_argument("--report",      default=None,
                     help="Optional path to save JSON damage report")
@@ -1858,7 +1934,5 @@ Examples — Image:
             save_parts  = not args.no_parts,
             save_damage = not args.no_damage,
             report_path = args.report,
-            min_votes   = args.min_votes,
-            min_ratio   = args.min_ratio,
             debug       = args.debug,
         )
