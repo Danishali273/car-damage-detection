@@ -1786,7 +1786,7 @@ def run_image(
       voting only makes sense across multiple frames.
     • Output is two annotated images (_parts / _damage) instead of videos.
     """
-    validate_runtime_options(parts_conf, damage_conf, min_votes=1, min_ratio=0.0)
+    validate_runtime_options(parts_conf, damage_conf)
 
     log.info("=" * 65)
     log.info("Car Damage Detection — Image Mode")
@@ -1806,13 +1806,12 @@ def run_image(
     log.info("Resolution : %dx%d", w, h)
 
     # For a single image bypass temporal voting — every detection is
-    # immediately confirmed (min_votes=1, min_ratio=0.0).
+    # immediately confirmed.  Passing fps=1.0 makes compute_adaptive_thresholds
+    # produce min_votes=1 and direction_streak=1 via the normal formula.
     pipeline = CarDamagePipeline(
         parts_conf_floor=parts_conf,
         damage_conf_floor=damage_conf,
-        min_votes=1,
-        min_ratio=0.0,
-        direction_streak_needed=1,
+        fps=1.0,
     )
 
     parts_frm, damage_frm, stable_dir = pipeline.process_frame(
