@@ -101,29 +101,6 @@ CAR_PARTS_MAP: Dict[str, List[str]] = {
     ],
 }
 
-# ── Per-class damage thresholds ───────────────────────────────────────────────
-DAMAGE_THRESHOLDS: Dict[str, float] = {
-    "dent":         0.50,
-    "glass_break":  0.50,
-    "scratch":      0.50,
-    "crack":        0.50,
-    "broken_light": 0.50,
-    "flat_tire":    0.80,
-}
-
-# ── Per-part segmentation thresholds ─────────────────────────────────────────
-# NOTE: Keys must exactly match the part names used in CAR_PARTS_MAP and
-# returned by the parts segmentation model.  Entries not in CAR_PARTS_MAP
-# (Back-window, Front-window, Roof) are retained because the model may
-# still detect them; they will simply be filtered by the context-aware list.
-PART_THRESHOLDS: Dict[str, float] = {k: 0.50 for k in [
-    "Back-bumper", "Back-door", "Back-wheel", "Back-window",
-    "Back-windshield", "Fender", "Front-bumper", "Front-door",
-    "Front-wheel", "Front-window", "Grille", "Headlight", "Hood",
-    "License-plate", "Mirror", "Quarter-panel", "Rocker-panel",
-    "Roof", "Tail-light", "Trunk", "Windshield",
-]}
-
 # ── Which damage types are physically possible on each part ───────────────────
 # Covers every part that appears in CAR_PARTS_MAP plus glass/roof variants
 # that the segmentation model may detect outside of strict context filtering.
@@ -156,14 +133,12 @@ PART_DAMAGE_MAP: Dict[str, List[str]] = {
     "Quarter-panel":   ["dent", "scratch", "crack"],
     "Rocker-panel":    ["dent", "scratch", "crack"],
 }
-_BODY_PANEL_DEFAULT = ["dent", "scratch", "crack"]
 
 # ── DamageRegistry voting parameters ─────────────────────────────────────────
 # All temporal thresholds are expressed in SECONDS — FPS-agnostic by design.
 # compute_adaptive_thresholds() converts them to frame counts at runtime.
 REGISTRY_MIN_VOTE_SECONDS = 0.20  # damage must be visible for >= 0.20 s to be confirmed
 REGISTRY_MIN_VOTE_RATIO   = 0.15  # damage seen in >= 15 % of frames it was observable
-DIRECTION_BUFFER_SECONDS  = 0.10  # consecutive seconds required to commit a new direction
 INSTANCE_MATCH_RADIUS     = 0.30
 
 
@@ -172,9 +147,9 @@ def compute_adaptive_thresholds(fps: float) -> dict:
     Convert time-based threshold constants into frame counts for a given FPS.
 
     This makes the temporal voting logic FPS-agnostic:
-      • At 15 FPS  →  min_votes = 3,  direction_streak = 2
-      • At 30 FPS  →  min_votes = 6,  direction_streak = 3
-      • At 60 FPS  →  min_votes = 12, direction_streak = 6
+      • At 15 FPS  →  min_votes = 3
+      • At 30 FPS  →  min_votes = 6
+      • At 60 FPS  →  min_votes = 12
 
     Parameters
     ----------
@@ -186,7 +161,6 @@ def compute_adaptive_thresholds(fps: float) -> dict:
     dict with keys:
         min_votes        – minimum frame-vote count to confirm a damage
         min_ratio        – minimum vote / frames-seen ratio (unchanged)
-        direction_streak – consecutive frames required for a direction commit
     """
     if fps <= 0:
         raise ValueError(
@@ -194,21 +168,15 @@ def compute_adaptive_thresholds(fps: float) -> dict:
             "Check that the video file reports a valid frame rate."
         )
 
-    min_votes        = max(1, round(fps * REGISTRY_MIN_VOTE_SECONDS))
-    direction_streak = max(1, round(fps * DIRECTION_BUFFER_SECONDS))
+    min_votes = max(1, round(fps * REGISTRY_MIN_VOTE_SECONDS))
 
     log.info(
-        "Adaptive thresholds @ %.1f FPS → min_votes=%d (%.2fs)  "
-        "direction_streak=%d (%.2fs)  min_ratio=%.0f%%",
-        fps,
-        min_votes,        REGISTRY_MIN_VOTE_SECONDS,
-        direction_streak, DIRECTION_BUFFER_SECONDS,
-        REGISTRY_MIN_VOTE_RATIO * 100,
+        "Adaptive thresholds @ %.1f FPS → min_votes=%d (%.2fs)  min_ratio=%.0f%%",
+        fps, min_votes, REGISTRY_MIN_VOTE_SECONDS, REGISTRY_MIN_VOTE_RATIO * 100
     )
     return {
-        "min_votes":        min_votes,
-        "min_ratio":        REGISTRY_MIN_VOTE_RATIO,
-        "direction_streak": direction_streak,
+        "min_votes": min_votes,
+        "min_ratio": REGISTRY_MIN_VOTE_RATIO,
     }
 
 # ── Severity classification thresholds ────────────────────────────────────────
@@ -228,16 +196,6 @@ def classify_severity(ratio: float) -> str:
             return label
     return "Severe"  # anything above 100 % (shouldn't happen, but safe fallback)
 
-# ── Overlapping direction groups (for cross-view deduplication) ───────────────
-# Directions within the same group share physical overlap, so the same scratch
-# on a fender can appear in both "front-right-side" and "right-side" views.
-# entry when the same (part, damage_type) is detected from two overlapping angles.
-DIRECTION_OVERLAP_GROUPS: List[Set[str]] = [
-    {"front-right-side", "right-side", "front"},
-    {"front-left-side",  "left-side",  "front"},
-    {"back-right-side",  "right-side",  "back"},
-    {"back-left-side",   "left-side",   "back"},
-]
 
 # ── Side parts and resolution helper ──────────────────────────────────────────
 # Prepend "Left" or "Right" to side-specific parts based on the camera view
@@ -312,15 +270,7 @@ def part_color(part_name: str) -> Tuple[int, int, int]:
 
 def get_allowed_damage(part_name: str) -> List[str]:
     """Return damage types that are physically possible on this part."""
-    return PART_DAMAGE_MAP.get(part_name, _BODY_PANEL_DEFAULT)
-
-
-def passes_damage_threshold(damage_class: str, conf: float) -> bool:
-    return conf >= DAMAGE_THRESHOLDS.get(damage_class, 0.40)
-
-
-def passes_part_threshold(part_name: str, conf: float) -> bool:
-    return conf >= PART_THRESHOLDS.get(part_name, 0.50)
+    return PART_DAMAGE_MAP.get(part_name)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -350,87 +300,6 @@ class PerspectiveTransformer:
         (acts as a safe passthrough for unexpected classes).
         """
         return self._map.get(raw_label, raw_label)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4.  DIRECTION FLICKER SUPPRESSOR
-# ══════════════════════════════════════════════════════════════════════════════
-
-class DirectionBuffer:
-    """
-    Detects genuine direction transitions while suppressing single-frame flicker.
-
-    Strategy — streak-based commit
-    --------------------------------
-    A new direction is *committed* (accepted as the stable direction) only when
-    it appears in ``streak_needed`` **consecutive** frames.
-    A single anomalous frame is therefore ignored, but a real camera-angle
-    transition (which lasts many frames) is detected quickly.
-
-    No confidence gating is applied.  Every frame participates in the streak
-    regardless of the classifier's confidence score.  This is safe because:
-
-    1. The streak mechanism (default 3 consecutive frames) already suppresses
-       single-frame flicker / misclassifications.
-    2. If a wrong direction *does* commit, CAR_PARTS_MAP limits which parts
-       are searched for, and the parts segmenter will simply not find parts
-       that are physically invisible — so no false damage gets recorded.
-    3. Gating on confidence *hurts* during genuine camera transitions where
-       the classifier outputs the correct new direction with moderate
-       confidence; discarding those frames delays the transition and forces
-       the pipeline to use the old (now wrong) direction.
-    """
-
-    def __init__(
-        self,
-        streak_needed: int = 3,
-    ) -> None:
-        self._streak_needed = streak_needed
-        # Current pending direction and how many consecutive frames it has held
-        self._pending: Optional[str] = None
-        self._pending_streak: int    = 0
-        # The last committed (stable) direction
-        self._committed: Optional[str] = None
-
-    def update(self, direction: str, conf: float) -> Optional[str]:
-        """
-        Feed a new raw observation.
-
-        Parameters
-        ----------
-        direction : car-centric direction label
-        conf      : classifier confidence for the top-1 prediction
-                    (kept in the signature for API compatibility; not used
-                    for gating — see class docstring for rationale)
-
-        Returns
-        -------
-        Stable direction string, or None if no direction has been committed yet.
-        """
-        if direction == self._pending:
-            # Same direction as the candidate — extend the streak
-            self._pending_streak += 1
-        else:
-            # New candidate — start fresh streak
-            self._pending        = direction
-            self._pending_streak = 1
-
-        if self._pending_streak >= self._streak_needed:
-            # Streak long enough — commit
-            if direction != self._committed:
-                log.debug(
-                    "DirectionBuffer: transition %s → %s (streak=%d)",
-                    self._committed, direction, self._pending_streak,
-                )
-            self._committed      = direction
-            # Reset streak so it doesn't re-log on every subsequent frame
-            self._pending_streak = 0
-
-        return self._committed
-
-    @property
-    def stable_direction(self) -> Optional[str]:
-        return self._committed
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -821,7 +690,6 @@ class DamageRegistry:
                 report.append({
                     "track_id":     track_id,
                     "part_name":    part_name,
-                    "location":     inst.best_location or part_name.replace("-", " ").title(),
                     "damage_type":  inst.damage_type,
                     "confidence":   round(inst.best_conf, 4),
                     "severity":     inst.severity,
@@ -842,7 +710,7 @@ class DamageRegistry:
             sev = item.get('severity', 'N/A')
             sev_ratio = item.get('severity_ratio', 0.0)
             lines.append(
-                f"  {item['location']:<30}  "
+                f"  {item['part_name']:<30}  "
                 f"{item['damage_type']:<14}  "
                 f"conf={item['confidence']:.2f}  "
                 f"severity={sev:<8} ({sev_ratio:.1%})"
@@ -1025,8 +893,6 @@ class PartsSegmenter:
             # ── Context-aware filter ──────────────────────────────────────────
             if part_name not in allowed_parts:
                 continue
-            if not passes_part_threshold(part_name, conf):
-                continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             mask_pts = None
@@ -1100,8 +966,6 @@ class DamageDetector:
             d_conf = float(box.conf[0])
 
             if d_type not in allowed_damages:
-                continue
-            if not passes_damage_threshold(d_type, d_conf):
                 continue
 
             bx1, by1, bx2, by2 = map(int, box.xyxy[0])
@@ -1257,7 +1121,6 @@ class CarDamagePipeline:
 
         # ── Adaptive temporal thresholds (always derived from FPS) ────────
         adaptive = compute_adaptive_thresholds(fps)
-        self.dir_buffer = DirectionBuffer(streak_needed=adaptive["direction_streak"])
         self.registry   = DamageRegistry(
             min_votes=adaptive["min_votes"],
             min_ratio=adaptive["min_ratio"],
@@ -1299,16 +1162,8 @@ class CarDamagePipeline:
         # ── Step a: Direction classification ─────────────────────────────────
         raw_label, car_direction, dir_conf = self.direction_clf.predict(frame)
 
-        # ── Step b: Flicker suppression ───────────────────────────────────────
-        # When the car is turning or the frame is motion-blurred, the classifier
-        # may oscillate between adjacent directions (e.g., front ↔ front-left).
-        # The DirectionBuffer absorbs these transients by voting over the last N
-        # frames and returning the modal direction.
-        stable_dir = self.dir_buffer.update(car_direction, dir_conf)
-
-        if stable_dir is None:
-            # Buffer still warming up — not enough frames yet to vote
-            return parts_frame, damage_frame, None
+        # ── Step b: Use raw frame direction ───────────────────────────────────
+        stable_dir = car_direction
 
         # ── Step c: Context-aware part list ───────────────────────────────────
         allowed_parts = CAR_PARTS_MAP.get(stable_dir, [])
@@ -1883,10 +1738,10 @@ Examples — Image:
     ap.add_argument("--output",      default="result_pipeline",
                     help="Base output path without extension (default: result_pipeline).\n"
                          "Extensions are added automatically (_parts.mp4 / _parts.jpg etc.).")
-    ap.add_argument("--parts-conf",  type=float, default=0.30,
-                    help="Parts segmentation conf floor (default: 0.30)")
-    ap.add_argument("--damage-conf", type=float, default=0.30,
-                    help="Damage detection conf floor (default: 0.30)")
+    ap.add_argument("--parts-conf",  type=float, default=0.50,
+                    help="Parts segmentation conf floor (default: 0.50)")
+    ap.add_argument("--damage-conf", type=float, default=0.50,
+                    help="Damage detection conf floor (default: 0.50)")
     # ── Video-only flags ───────────────────────────────────────────────────────
     ap.add_argument("--frame-skip",  type=int, default=1,
                     help="[Video only] Process every Nth frame (default: 1)")
