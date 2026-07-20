@@ -24,7 +24,6 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -69,7 +68,7 @@ PERSPECTIVE_MAP: Dict[str, str] = {
 # ── Context-aware part list per car-centric direction ─────────────────────────
 CAR_PARTS_MAP: Dict[str, List[str]] = {
     "front": [
-        "Front-bumper", "Grille", "Headlight", "Hood",
+        "Front-bumper", "Headlight", "Hood",
         "License-plate", "Windshield",
     ],
     "back": [
@@ -530,15 +529,16 @@ class PartRecord:
         best_dist: float = float("inf")
 
         for inst in existing_list:
-            # Aspect-Ratio Preserving Distance
-            w2 = crop_w ** 2
-            h2 = crop_h ** 2
-            diag2 = w2 + h2
-            if diag2 > 0:
-                w_weight = w2 / diag2
-                h_weight = h2 / diag2
+            # Elongated Crop Distance Weighting
+            # Normalizing by the diagonal over-compresses spatial deltas on extremely wide
+            # or tall components (e.g., a long Rocker-panel), causing distinct issues to cluster.
+            # Normalizing by the geometric mean (Area) prevents this by scaling weights inversely
+            # to aspect ratio.
+            if crop_w > 0 and crop_h > 0:
+                w_weight = crop_w / crop_h
+                h_weight = crop_h / crop_w
             else:
-                w_weight, h_weight = 0.5, 0.5
+                w_weight, h_weight = 1.0, 1.0
             
             dist = (w_weight * (cx - inst.cx_norm) ** 2 + 
                     h_weight * (cy - inst.cy_norm) ** 2) ** 0.5
@@ -1073,9 +1073,6 @@ class CarDamagePipeline:
     │ a) DirectionClassifier.predict(frame)                               │
     │    → raw camera label + confidence                                  │
     │                                                                     │
-    │ b) DirectionBuffer.update(car_direction, conf)                      │
-    │    → stable_direction  (flicker-smoothed)                           │
-    │                                                                     │
     │ c) CAR_PARTS_MAP[stable_direction]                                  │
     │    → allowed_parts list for this view                               │
     │                                                                     │
@@ -1287,7 +1284,23 @@ class CarDamagePipeline:
                 if assigned_part is not None and best_dist < -15.0:
                     continue
 
-                # If we successfully matched to a part, use its info
+                # Re-attribution guard: before accepting the newly assigned part,
+                # verify that d_type is physically valid for that part.
+                # Example: a scratch detected on a Fender crop (fender bbox bleeds
+                # over the tire) whose centroid lands inside the wheel polygon would
+                # otherwise be recorded as "Front-wheel: scratch" — but the wheel
+                # only supports "flat_tire". Instead of dropping, fall back to the
+                # original part.
+                if assigned_part is not None:
+                    if d_type not in get_allowed_damage(assigned_part["part_name"]):
+                        log.debug(
+                            "Re-attribution guard: reverting '%s' from '%s' back to '%s' "
+                            "(not in allowed damage types for target part).",
+                            d_type, assigned_part["part_name"], part_name
+                        )
+                        assigned_part = None
+
+                # If we successfully matched to a part (and passed the guard), use its info
                 if assigned_part is not None:
                     target_part_name = assigned_part["part_name"]
                     target_color = part_color(target_part_name)
@@ -1307,20 +1320,6 @@ class CarDamagePipeline:
                     acrop_h = crop_h
                     target_bbox = d_bbox
                     target_part_area_px = part_info.get("part_area_px", 0.0)
-
-                # Re-attribution guard: after changing the owning part, verify
-                # that d_type is still physically valid for that part.
-                # Example: a scratch detected on a Fender crop (fender bbox bleeds
-                # over the tire) whose centroid lands inside the wheel polygon would
-                # otherwise be recorded as "Front-wheel: scratch" — but the wheel
-                # only supports "flat_tire".  Drop such cross-part bleed-over hits.
-                if d_type not in get_allowed_damage(target_part_name):
-                    log.debug(
-                        "Re-attribution guard: skipping '%s' on '%s' "
-                        "(not in allowed damage types for that part).",
-                        d_type, target_part_name,
-                    )
-                    continue
 
                 # Keep a copy of the crop-relative mask for the registry
                 # (centroid computation via cv2.moments requires crop-relative coords).
@@ -1633,9 +1632,6 @@ def run_image(
     Key differences from run_video
     -------------------------------
     • No VideoCapture loop — the image is treated as a single frame.
-    • DirectionBuffer still runs but receives exactly one observation;
-      because maxlen=5 and the buffer is pre-warmed after the first
-      high-conf update, stable_dir is set immediately.
     • DamageRegistry is created with min_votes=1 so
       that a single-frame detection counts as "confirmed" — temporal
       voting only makes sense across multiple frames.
