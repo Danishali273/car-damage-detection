@@ -1,31 +1,17 @@
 """
-damage_pipeline.py — Three-Model Car Damage Detection over Video
+damage_pipeline.py — Two-Pass Keyframe Car Damage Detection
 ===================================================================
-Chains three independently-trained YOLOv8 models on every processed frame:
+Instead of processing every frame with all three models and voting,
+this pipeline uses a fast two-pass strategy:
 
-    1) Angle model      (classify)  -> which side of the car the camera sees
-    2) Parts model       (segment)   -> where each panel/part is, cropped
-    3) Damage model       (segment)   -> damage masks (not boxes) inside each crop
+    Pass 1 (fast):   Scan video with the angle classifier only.
+                     Pick the single best frame per direction (8 directions).
 
-Design notes (why this isn't a line-for-line copy of the original)
---------------------------------------------------------------------
-- One `PipelineConfig` dataclass holds every tunable instead of a dozen
-  module-level constants — makes it trivial to run multiple configurations
-  (e.g. grid-searching conf thresholds) without editing the file.
-- `CropStrategy` is a first-class, swappable setting. The earlier diagnosis
-  in this conversation was that the damage model sees clean, tightly-boxed
-  training crops but noisier, background-bleeding crops in production. So
-  this version supports three crop modes (bbox / padded-bbox / mask-matted)
-  instead of hard-coding a single bbox crop, so you can A/B which one your
-  damage model actually agrees with.
-- Voting/aggregation is one small `EvidenceLedger` class using plain
-  Counters + running stats, instead of a PartRecord/DamageInstance class
-  pair. Functionally equivalent (confirm damage only after enough frames
-  vote for it) but far less code to maintain.
-- Part re-attribution (deciding which part a damage box "really" belongs
-  to when boxes overlap) is intentionally simplified to nearest-centroid
-  containment only — the original's extra fallback branches are collapsed
-  into one helper.
+    Pass 2 (targeted): Run parts segmentation + damage detection on
+                       only those ~8 keyframes.
+
+Result: ~10-50× faster than frame-by-frame, with cleaner results
+since each direction gets a deliberately-selected, high-quality frame.
 """
 
 from __future__ import annotations
@@ -33,8 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -75,18 +61,24 @@ class PipelineConfig:
     crop_strategy: str = "matte"
     crop_padding_ratio: float = 0.08  # only used by "padded"
 
-    # A frame's direction is only trusted once it's been the majority vote
-    # over this many recent frames — smooths single-frame misclassifications.
-    direction_smoothing_window: int = 7
+    # How often to sample frames during the angle-scan pass.
+    # E.g. 5 means check every 5th frame for direction classification.
+    sample_every_n: int = 1
 
-    # Confirmation thresholds for the evidence ledger (see EvidenceLedger).
-    min_votes: int = 4
-    min_vote_ratio: float = 0.20
+    # Minimum number of frames that must classify to the same direction
+    # before that direction is considered "confirmed".  This filters out
+    # one-off misclassifications — if only 1 random frame says "front"
+    # but the angle model never sees "front" again, it's likely wrong.
+    min_direction_frames: int = 1
 
-    # Same-instance clustering radius in normalized crop-centroid distance.
-    cluster_radius: float = 0.28
+    # How many frames to analyze per confirmed direction.
+    # More frames = better coverage (catches damage missed by one angle),
+    # but slightly slower.  E.g. 3 means ~24 total frames across 8 directions.
+    frames_per_direction: int = 5
 
-    frame_skip: int = 1
+    # Save the selected keyframe images to disk for inspection.
+    save_keyframes: bool = True
+
     draw: bool = True
 
 
@@ -127,6 +119,21 @@ DAMAGE_ALLOWED_ON_PART: Dict[str, List[str]] = {
 }
 
 SEVERITY_BANDS: List[Tuple[float, str]] = [(0.05, "Minor"), (0.20, "Moderate"), (1.01, "Severe")]
+
+# Singular car parts that span across multiple adjacent view angles
+SINGULAR_PARTS: set = {"Front-bumper", "Back-bumper", "Hood", "Trunk", "Windshield", "Back-windshield"}
+
+# Adjacent views for cross-view deduplication
+VIEW_ADJACENCY: Dict[str, set] = {
+    "front": {"front-left-side", "front-right-side"},
+    "back": {"back-left-side", "back-right-side"},
+    "left-side": {"front-left-side", "back-left-side"},
+    "right-side": {"front-right-side", "back-right-side"},
+    "front-left-side": {"front", "left-side"},
+    "front-right-side": {"front", "right-side"},
+    "back-left-side": {"back", "left-side"},
+    "back-right-side": {"back", "right-side"},
+}
 
 
 def severity_for(ratio: float) -> str:
@@ -274,128 +281,73 @@ def build_crop(frame: np.ndarray, part: PartBox, cfg: PipelineConfig) -> Tuple[n
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# EVIDENCE LEDGER — temporal voting, in far fewer lines than the original
-# ═══════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class _Evidence:
-    votes: int = 0
-    frames: set = field(default_factory=set)
-    best_conf: float = 0.0
-    best_view: str = ""
-    cx_sum: float = 0.0
-    cy_sum: float = 0.0
-    max_damage_area: float = 0.0
-    max_part_area: float = 0.0
-
-    def add(self, frame_idx: int, conf: float, cx: float, cy: float, damage_area: float, part_area: float, view: str) -> None:
-        if frame_idx in self.frames:
-            if conf > self.best_conf:
-                self.best_conf = conf
-                self.best_view = view
-            return
-        self.frames.add(frame_idx)
-        self.votes += 1
-        if conf > self.best_conf or self.best_conf == 0.0:
-            self.best_conf = conf
-            self.best_view = view
-        self.cx_sum += cx
-        self.cy_sum += cy
-        self.max_damage_area = max(self.max_damage_area, damage_area)
-        self.max_part_area = max(self.max_part_area, part_area)
-
-    @property
-    def centroid(self) -> Tuple[float, float]:
-        return (self.cx_sum / self.votes, self.cy_sum / self.votes) if self.votes else (0.5, 0.5)
-
-    @property
-    def severity_ratio(self) -> float:
-        return (self.max_damage_area / self.max_part_area) if self.max_part_area > 0 else 0.0
-
-
-class EvidenceLedger:
-    """Accumulates (part, damage_type) evidence across frames and confirms
-    only what survives a minimum-vote / minimum-ratio bar."""
-
-    def __init__(self, cfg: PipelineConfig):
-        self.cfg = cfg
-        self._entries: Dict[Tuple[str, str], List[_Evidence]] = defaultdict(list)
-        self._part_frames_seen: Counter = Counter()
-
-    def note_part_seen(self, part_name: str, frame_idx: int) -> None:
-        self._part_frames_seen[part_name] += 1
-
-    def note_damage(self, part_name: str, dtype: str, frame_idx: int, conf: float,
-                     cx: float, cy: float, damage_area: float, part_area: float, view: str) -> None:
-        key = (part_name, dtype)
-        bucket = self._entries[key]
-        best, best_dist = None, float("inf")
-        for ev in bucket:
-            ecx, ecy = ev.centroid
-            d = ((cx - ecx) ** 2 + (cy - ecy) ** 2) ** 0.5
-            if d < best_dist:
-                best, best_dist = ev, d
-        if best is None or best_dist > self.cfg.cluster_radius:
-            best = _Evidence()
-            bucket.append(best)
-        best.add(frame_idx, conf, cx, cy, damage_area, part_area, view)
-
-    def confirmed_report(self) -> List[Dict]:
-        report = []
-        for (part_name, dtype), bucket in self._entries.items():
-            seen = max(self._part_frames_seen[part_name], 1)
-            for ev in bucket:
-                ratio = ev.votes / seen
-                if ev.votes >= self.cfg.min_votes and ratio >= self.cfg.min_vote_ratio:
-                    report.append({
-                        "part": part_name,
-                        "damage_type": dtype,
-                        "car_view": ev.best_view,
-                        "confidence": round(ev.best_conf, 3),
-                        "severity": severity_for(ev.severity_ratio),
-                        "severity_ratio": round(ev.severity_ratio, 4),
-                    })
-        return sorted(report, key=lambda r: (-r["confidence"]))
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# DIRECTION SMOOTHING — majority vote over a rolling window
-# ═══════════════════════════════════════════════════════════════════════════
-
-class DirectionSmoother:
-    def __init__(self, window: int):
-        self._buf: List[str] = []
-        self._window = max(1, window)
-
-    def push(self, direction: str) -> str:
-        self._buf.append(direction)
-        self._buf = self._buf[-self._window:]
-        return Counter(self._buf).most_common(1)[0][0]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # PART RE-ATTRIBUTION — which part does a damage box really belong to?
 # ═══════════════════════════════════════════════════════════════════════════
 
-def reattribute(damage_center: Tuple[int, int], parts: List[PartBox], fallback: PartBox) -> PartBox:
-    """Pick whichever part's mask actually contains the damage centroid.
-    Falls back to the crop's own part when no mask contains it or the
-    damage type wouldn't be valid there anyway."""
-    best, best_score = None, -1e9
+def reattribute(dmg: DamageBox, origin: Tuple[int, int], parts: List[PartBox], fallback: PartBox) -> PartBox:
+    """Re-attribute damage to whichever detected part's mask or bounding box
+    actually contains/overlaps the damage best in frame coordinates, provided
+    the damage type is allowed on that target part."""
+    ox, oy = origin
+    dx1, dy1, dx2, dy2 = dmg.xyxy_in_crop
+    fx1, fy1, fx2, fy2 = ox + dx1, oy + dy1, ox + dx2, oy + dy2
+    damage_center = (int((fx1 + fx2) / 2), int((fy1 + fy2) / 2))
+
+    best_part = None
+    best_score = -1e9
+
     for p in parts:
-        if p.mask_xy is None or p.mask_xy.size < 6:
+        # Must be physically allowed on this part
+        if dmg.dtype not in DAMAGE_ALLOWED_ON_PART.get(p.name, []):
             continue
-        score = cv2.pointPolygonTest(p.mask_xy, damage_center, True)
+
+        score = -1e9
+        # 1. Mask polygon containment test (if part has polygon mask)
+        if p.mask_xy is not None and p.mask_xy.size >= 6:
+            poly_dist = cv2.pointPolygonTest(p.mask_xy, damage_center, True)
+            if poly_dist >= 0:
+                score = 100.0 + poly_dist
+            else:
+                score = poly_dist
+        else:
+            # 2. Bounding box containment test (if part only has bbox)
+            px1, py1, px2, py2 = p.xyxy
+            if px1 <= damage_center[0] <= px2 and py1 <= damage_center[1] <= py2:
+                pcx, pcy = (px1 + px2) / 2.0, (py1 + py2) / 2.0
+                dist = ((damage_center[0] - pcx)**2 + (damage_center[1] - pcy)**2)**0.5
+                score = 50.0 - dist
+            else:
+                ix1, iy1 = max(fx1, px1), max(fy1, py1)
+                ix2, iy2 = min(fx2, px2), min(fy2, py2)
+                if ix2 > ix1 and iy2 > iy1:
+                    inter_area = (ix2 - ix1) * (iy2 - iy1)
+                    score = inter_area / float((fx2 - fx1) * (fy2 - fy1))
+
         if score > best_score:
-            best, best_score = p, score
-    if best is not None and best_score >= -15.0:
-        return best
+            best_score = score
+            best_part = p
+
+    if best_part is not None and best_score >= -30.0:
+        return best_part
+
+    if dmg.dtype in DAMAGE_ALLOWED_ON_PART.get(fallback.name, []):
+        return fallback
+
     return fallback
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ORCHESTRATOR
+# ORCHESTRATOR — Two-Pass Keyframe Pipeline
 # ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Keyframe:
+    """A selected frame for one direction."""
+    direction: str
+    frame: np.ndarray
+    confidence: float
+    frame_idx: int
+
 
 class DamagePipeline:
     def __init__(self, cfg: PipelineConfig):
@@ -404,16 +356,128 @@ class DamagePipeline:
         self.angle = AngleStage(cfg.angle_model_path)
         self.parts = PartsStage(cfg.parts_model_path)
         self.damage = DamageStage(cfg.damage_model_path)
-        self.direction_smoother = DirectionSmoother(cfg.direction_smoothing_window)
-        self.ledger = EvidenceLedger(cfg)
         log.info("Models ready.")
+
+    # ── Pass 1: Scan video, pick best frames per direction ───────────────
+
+    def scan_video(self, video_path: str) -> Dict[str, List[Keyframe]]:
+        """Run only the angle classifier on sampled frames.
+
+        Collects ALL candidates per direction, confirms a direction only if
+        it was classified by at least `min_direction_frames` frames, then
+        picks the top `frames_per_direction` frames spread apart in time.
+
+        Returns {direction: [Keyframe, ...]} with up to N keyframes each.
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        # Collect every candidate: direction -> list of (conf, frame_idx, frame)
+        candidates: Dict[str, List[Tuple[float, int, np.ndarray]]] = defaultdict(list)
+
+        frame_idx = 0
+        scanned = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_idx += 1
+            if frame_idx % self.cfg.sample_every_n != 0:
+                continue
+
+            raw_view, conf = self.angle.infer(frame)
+            car_direction = CAMERA_TO_CAR_DIRECTION.get(raw_view, raw_view)
+            scanned += 1
+
+            candidates[car_direction].append((conf, frame_idx, frame.copy()))
+
+            if total_frames > 0:
+                print(f"\r[Pass 1] Scanning frame {frame_idx}/{total_frames} "
+                      f"({(frame_idx / total_frames) * 100:.1f}%) — "
+                      f"{len(candidates)} directions seen" + " " * 15, end="", flush=True)
+            else:
+                print(f"\r[Pass 1] Scanning frame {frame_idx}… — "
+                      f"{len(candidates)} directions seen" + " " * 15, end="", flush=True)
+
+        print()
+        cap.release()
+
+        # Filter + select top N frames per confirmed direction
+        min_frames = self.cfg.min_direction_frames
+        n_pick = self.cfg.frames_per_direction
+        confirmed: Dict[str, List[Keyframe]] = {}
+
+        for direction, entries in sorted(candidates.items()):
+            count = len(entries)
+            if count < min_frames:
+                log.warning("  %-20s REJECTED — only %d frame(s), need %d",
+                            direction, count, min_frames)
+                continue
+
+            # Select top N frames, spread apart in time
+            selected = self._pick_spread_frames(entries, n_pick)
+            confirmed[direction] = [
+                Keyframe(direction=direction, frame=frm,
+                         confidence=conf, frame_idx=fidx)
+                for conf, fidx, frm in selected
+            ]
+
+        log.info("Pass 1 done: scanned %d frames, confirmed %d/%d directions "
+                 "(min_direction_frames=%d, frames_per_direction=%d).",
+                 scanned, len(confirmed), len(candidates), min_frames, n_pick)
+        for d, kfs in sorted(confirmed.items()):
+            total = len(candidates[d])
+            frames_str = ", ".join(f"#{kf.frame_idx}" for kf in kfs)
+            log.info("  %-20s %d frame(s) selected [%s]  (%d total agreed)",
+                     d, len(kfs), frames_str, total)
+        return confirmed
+
+    @staticmethod
+    def _pick_spread_frames(
+        entries: List[Tuple[float, int, np.ndarray]], n: int
+    ) -> List[Tuple[float, int, np.ndarray]]:
+        """Pick up to `n` frames from `entries`, preferring high confidence
+        while spreading them apart in time so we don't get N near-identical
+        frames from the same moment."""
+        if len(entries) <= n:
+            return entries
+
+        # Sort by confidence descending
+        by_conf = sorted(entries, key=lambda e: e[0], reverse=True)
+
+        # Greedily pick frames that are temporally spread apart
+        selected: List[Tuple[float, int, np.ndarray]] = []
+        # Minimum frame gap: total span / (n+1) so they're spaced out
+        frame_indices = [e[1] for e in entries]
+        span = max(frame_indices) - min(frame_indices)
+        min_gap = max(1, span // (n + 1))
+
+        for entry in by_conf:
+            if len(selected) >= n:
+                break
+            fidx = entry[1]
+            # Check temporal distance to already-selected frames
+            if all(abs(fidx - s[1]) >= min_gap for s in selected):
+                selected.append(entry)
+
+        # If we couldn't fill N due to gap constraint, relax and fill remaining
+        if len(selected) < n:
+            for entry in by_conf:
+                if len(selected) >= n:
+                    break
+                if entry not in selected:
+                    selected.append(entry)
+
+        return selected
+
+    # ── Pass 2: Run parts + damage on selected keyframes ─────────────────
 
     def _draw_damage(self, vis: np.ndarray, dmg: DamageBox, origin: Tuple[int, int],
                       fallback_box: Tuple[int, int, int, int], part_name: str) -> None:
-        """Render the damage as a filled, semi-transparent segmentation mask
-        (this is a segmentation model — draw what it actually predicted,
-        not a bounding box around it). Falls back to an outline box only
-        when the model returned no polygon for this detection."""
+        """Render damage as a filled, semi-transparent segmentation mask."""
         ox, oy = origin
         if dmg.mask_in_crop is not None and dmg.mask_in_crop.size >= 6:
             poly = (dmg.mask_in_crop + np.array([ox, oy])).astype(np.int32)
@@ -431,102 +495,301 @@ class DamagePipeline:
                     (int(label_x), max(15, int(label_y) - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
-    def process_frame(self, frame: np.ndarray, frame_idx: int) -> np.ndarray:
-        raw_view, _ = self.angle.infer(frame)
-        car_direction = CAMERA_TO_CAR_DIRECTION.get(raw_view, raw_view)
-        stable_direction = self.direction_smoother.push(car_direction)
+    def analyze_keyframes(self, keyframes: Dict[str, List[Keyframe]]) -> List[Dict]:
+        """Run parts + damage detection on all keyframes per direction.
 
-        allowed_parts = PARTS_VISIBLE_FROM.get(stable_direction, [])
-        detected_parts = self.parts.infer(frame, allowed_parts, self.cfg.parts_conf)
+        Processes every selected frame, then deduplicates: if the same
+        (part, damage_type) is found on multiple frames of the same
+        direction, only the highest-confidence hit is kept.
 
-        vis = frame.copy()
-        for part in detected_parts:
-            self.ledger.note_part_seen(part.name, frame_idx)
-            crop, (ox, oy) = build_crop(frame, part, self.cfg)
-            if crop.size == 0:
-                continue
-
-            allowed_dmg = DAMAGE_ALLOWED_ON_PART.get(part.name, [])
-            for dmg in self.damage.infer(crop, allowed_dmg, self.cfg.damage_conf):
-                dx1, dy1, dx2, dy2 = dmg.xyxy_in_crop
-                frame_center = (ox + (dx1 + dx2) // 2, oy + (dy1 + dy2) // 2)
-
-                target = reattribute(frame_center, detected_parts, fallback=part)
-                if dmg.dtype not in DAMAGE_ALLOWED_ON_PART.get(target.name, []):
-                    target = part  # re-attribution guard: revert if physically invalid there
-
-                crop_h, crop_w = crop.shape[:2]
-                cx = ((dx1 + dx2) / 2) / crop_w
-                cy = ((dy1 + dy2) / 2) / crop_h
-                if dmg.mask_in_crop is not None and dmg.mask_in_crop.size >= 6:
-                    damage_area = float(cv2.contourArea(dmg.mask_in_crop.astype(np.float32)))
-                else:
-                    damage_area = float((dx2 - dx1) * (dy2 - dy1))
-
-                self.ledger.note_damage(
-                    part_name=target.name, dtype=dmg.dtype, frame_idx=frame_idx,
-                    conf=dmg.conf, cx=cx, cy=cy,
-                    damage_area=float(damage_area), part_area=target.area_px,
-                    view=stable_direction,
-                )
-
-                if self.cfg.draw:
-                    self._draw_damage(vis, dmg, origin=(ox, oy), fallback_box=(dx1, dy1, dx2, dy2),
-                                       part_name=target.name)
-
-            if self.cfg.draw:
-                x1, y1, x2, y2 = part.xyxy
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 180, 0), 1)
-                cv2.putText(vis, part.name, (x1, max(15, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 0), 1)
-
-        if self.cfg.draw:
-            cv2.putText(vis, f"view: {stable_direction}", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-        return vis
-
-    def run_on_video(self, video_path: str, out_video_path: Optional[str], out_report_path: Optional[str]) -> List[Dict]:
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open video: {video_path}")
-
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-
-        writer = None
-        if out_video_path:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(out_video_path, fourcc, fps / max(1, self.cfg.frame_skip), (w, h))
-
-        frame_idx = 0
+        Returns a list of raw damage hits (with 'vis_image' attached if drawing is enabled).
+        """
+        report: List[Dict] = []
+        total_frames = sum(len(kfs) for kfs in keyframes.values())
         processed = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frame_idx += 1
-            if frame_idx % self.cfg.frame_skip != 0:
-                continue
-            annotated = self.process_frame(frame, frame_idx)
-            processed += 1
-            if writer is not None:
-                writer.write(annotated)
+
+        for direction, kf_list in sorted(keyframes.items()):
+            # Per-direction raw hits (before dedup)
+            dir_hits: List[Dict] = []
+
+            for kf in kf_list:
+                processed += 1
+                print(f"\r[Pass 2] Analyzing {direction} frame #{kf.frame_idx} "
+                      f"({processed}/{total_frames})…" + " " * 20, end="", flush=True)
+
+                frame = kf.frame
+                allowed_parts = PARTS_VISIBLE_FROM.get(direction, [])
+                detected_parts = self.parts.infer(frame, allowed_parts, self.cfg.parts_conf)
+
+                for part in detected_parts:
+                    crop, (ox, oy) = build_crop(frame, part, self.cfg)
+                    if crop.size == 0:
+                        continue
+
+                    # Union of allowed damage types for all parts overlapping this crop box
+                    crop_x1, crop_y1, crop_x2, crop_y2 = part.xyxy
+                    overlapping_parts = [
+                        p for p in detected_parts
+                        if max(crop_x1, p.xyxy[0]) < min(crop_x2, p.xyxy[2]) and max(crop_y1, p.xyxy[1]) < min(crop_y2, p.xyxy[3])
+                    ]
+                    allowed_dmg = sorted(list({
+                        dtype
+                        for p in overlapping_parts
+                        for dtype in DAMAGE_ALLOWED_ON_PART.get(p.name, [])
+                    }))
+                    if not allowed_dmg:
+                        allowed_dmg = DAMAGE_ALLOWED_ON_PART.get(part.name, [])
+
+                    for dmg in self.damage.infer(crop, allowed_dmg, self.cfg.damage_conf):
+                        dx1, dy1, dx2, dy2 = dmg.xyxy_in_crop
+                        target = reattribute(dmg, origin=(ox, oy), parts=detected_parts, fallback=part)
+
+                        # Compute severity from damage area vs part area
+                        if dmg.mask_in_crop is not None and dmg.mask_in_crop.size >= 6:
+                            damage_area = float(cv2.contourArea(dmg.mask_in_crop.astype(np.float32)))
+                        else:
+                            damage_area = float((dx2 - dx1) * (dy2 - dy1))
+
+                        sev_ratio = damage_area / target.area_px if target.area_px > 0 else 0.0
+
+                        # Translate damage bbox back to full-frame coordinates
+                        fx1, fy1, fx2, fy2 = ox + dx1, oy + dy1, ox + dx2, oy + dy2
+                        
+                        damage_poly_str = None
+                        if dmg.mask_in_crop is not None and dmg.mask_in_crop.size >= 6:
+                            poly = (dmg.mask_in_crop + np.array([ox, oy])).astype(np.int32)
+                            damage_poly_str = " ".join(map(str, poly.reshape(-1).tolist()))
+
+                        # Compute relative centroid of damage within the part bbox
+                        px1, py1, px2, py2 = target.xyxy
+                        part_w = max(px2 - px1, 1)
+                        part_h = max(py2 - py1, 1)
+                        dmg_cx = (fx1 + fx2) / 2.0
+                        dmg_cy = (fy1 + fy2) / 2.0
+                        rel_cx = (dmg_cx - px1) / part_w
+                        rel_cy = (dmg_cy - py1) / part_h
+
+                        hit = {
+                            "part": target.name,
+                            "damage_type": dmg.dtype,
+                            "car_view": direction,
+                            "confidence": round(dmg.conf, 3),
+                            "severity": severity_for(sev_ratio),
+                            "severity_ratio": round(sev_ratio, 4),
+                            "frame_index": kf.frame_idx,
+                            "damage_bbox": " ".join(map(str, [fx1, fy1, fx2, fy2])),
+                            "damage_polygon": damage_poly_str,
+                            "_rel_centroid": (rel_cx, rel_cy)
+                        }
+
+                        if self.cfg.draw:
+                            # Create a fresh copy of the frame to draw ONLY this part's damage
+                            part_vis = frame.copy()
+                            self._draw_damage(part_vis, dmg, origin=(ox, oy),
+                                              fallback_box=(dx1, dy1, dx2, dy2),
+                                              part_name=target.name)
+                            # Draw the bounding box for the target part
+                            px1, py1, px2, py2 = target.xyxy
+                            cv2.rectangle(part_vis, (px1, py1), (px2, py2), (255, 180, 0), 1)
+                            cv2.putText(part_vis, target.name, (px1, max(15, py1 - 4)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 0), 1)
+                            cv2.putText(part_vis, f"view: {direction}  (frame #{kf.frame_idx})",
+                                        (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                            hit["vis_image"] = part_vis
+
+                        hit["raw_image"] = frame.copy()
+                        dir_hits.append(hit)
+
+            # Deduplicate: same (part, damage_type) → keep highest confidence
+            deduped = self._dedup_direction_hits(dir_hits)
+            report.extend(deduped)
+
+        print()
+        return report
+
+    @staticmethod
+    def _dedup_direction_hits(hits: List[Dict], centroid_threshold: float = 0.25) -> List[Dict]:
+        """Deduplicate (part, damage_type) pairs from multiple frames of
+        the same direction using relative centroid distance.
+
+        Two hits with the same (part, damage_type) are considered the SAME
+        physical damage if their relative centroids are within
+        `centroid_threshold` (Euclidean distance in 0-1 normalised space).
+        In that case, only the highest-confidence entry is kept.
+
+        If centroids are farther apart, they are treated as two physically
+        separate damages and BOTH are kept."""
+        # Group hits by (part, damage_type)
+        from collections import defaultdict
+        groups: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
+        for hit in hits:
+            key = (hit["part"], hit["damage_type"])
+            groups[key].append(hit)
+
+        result: List[Dict] = []
+        for key, group in groups.items():
+            # Sort by confidence descending
+            group.sort(key=lambda h: h["confidence"], reverse=True)
+
+            # Cluster: each accepted hit is a cluster centre
+            clusters: List[Dict] = []
+            for hit in group:
+                cx, cy = hit.get("_rel_centroid", (0.5, 0.5))
+                merged = False
+                for existing in clusters:
+                    ex, ey = existing.get("_rel_centroid", (0.5, 0.5))
+                    dist = ((cx - ex) ** 2 + (cy - ey) ** 2) ** 0.5
+                    if dist < centroid_threshold:
+                        # Same physical damage — existing already has higher conf
+                        merged = True
+                        break
+                if not merged:
+                    clusters.append(hit)
+            result.extend(clusters)
+        return result
+
+    @staticmethod
+    def _dedup_cross_view_hits(hits: List[Dict], centroid_threshold: float = 0.25) -> List[Dict]:
+        """Deduplicate damage detections across adjacent views for singular car parts.
+
+        For singular parts (Front-bumper, Hood, etc.), if the same damage type is detected
+        from adjacent or transitively-adjacent views (e.g. back-right-side → back → back-left-side),
+        keeps the entry with higher confidence only if their relative centroids are within
+        the threshold.  Uses a lenient threshold (0.50) because camera angle changes cause
+        the relative centroid to drift naturally.
+        Paired parts (doors, wheels) on left vs right sides are left separate.
+        """
+        # Build transitive adjacency: views that can "see" the same singular part
+        # e.g. back-right-side, back, back-left-side can all see Back-bumper
+        SINGULAR_VIEW_GROUPS = [
+            {"front", "front-left-side", "front-right-side"},
+            {"back", "back-left-side", "back-right-side"},
+        ]
+
+        def views_can_share_singular(v1: str, v2: str) -> bool:
+            """True if v1 and v2 belong to the same singular-part viewing group,
+            OR are directly adjacent."""
+            for group in SINGULAR_VIEW_GROUPS:
+                if v1 in group and v2 in group:
+                    return True
+            adj = VIEW_ADJACENCY.get(v1, set()) | {v1}
+            return v2 in adj
+
+        kept: List[Dict] = []
+        for hit in sorted(hits, key=lambda h: h["confidence"], reverse=True):
+            part = hit["part"]
+            dtype = hit["damage_type"]
+            view = hit["car_view"]
+            cx, cy = hit.get("_rel_centroid", (0.5, 0.5))
+
+            if part in SINGULAR_PARTS:
+                is_dup = False
+                for k in kept:
+                    if k["part"] == part and k["damage_type"] == dtype and views_can_share_singular(view, k["car_view"]):
+                        kx, ky = k.get("_rel_centroid", (0.5, 0.5))
+                        dist = ((cx - kx) ** 2 + (cy - ky) ** 2) ** 0.5
+                        if dist < centroid_threshold:
+                            is_dup = True
+                            break
+                if is_dup:
+                    continue
+            kept.append(hit)
+        return kept
+
+    # ── Main entry point ─────────────────────────────────────────────────
+
+    def run_on_video(self, video_path: str, out_dir: str, out_report_path: Optional[str]) -> List[Dict]:
+        """Two-pass pipeline: scan → select keyframes → analyze → report."""
+
+        # Pass 1: fast angle-only scan
+        keyframes = self.scan_video(video_path)
+        if not keyframes:
+            log.warning("No directions found in video!")
+            return []
+
+        # Pass 2: targeted parts + damage analysis on all selected frames
+        raw_report = self.analyze_keyframes(keyframes)
+
+        # Cross-view deduplication for singular parts across adjacent views
+        report = self._dedup_cross_view_hits(raw_report)
+
+        # Save outputs
+        out_path = Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        # Save annotated keyframe image per unique damaged part
+        if self.cfg.save_keyframes:
+            keyframes_dir = out_path / "keyframes"
+            orig_dir = keyframes_dir / "original"
+            anno_dir = keyframes_dir / "annotated"
+            orig_dir.mkdir(parents=True, exist_ok=True)
+            anno_dir.mkdir(parents=True, exist_ok=True)
             
-            if total_frames > 0:
-                print(f"\r[INFO] Processing frame {frame_idx}/{total_frames} ({(frame_idx / total_frames)*100:.1f}%)", end="", flush=True)
-            else:
-                print(f"\r[INFO] Processing frame {frame_idx}...", end="", flush=True)
+            # Clockwise mapping for easy file sorting
+            view_order = {
+                "front": "1",
+                "front-right-side": "2",
+                "right-side": "3",
+                "back-right-side": "4",
+                "back": "5",
+                "back-left-side": "6",
+                "left-side": "7",
+                "front-left-side": "8"
+            }
+            
+            used_filenames: Dict[str, int] = {}
+            for item in report:
+                safe_part = item["part"].replace(" ", "_")
+                safe_dmg = item["damage_type"].replace(" ", "_")
+                safe_view = item["car_view"].replace(" ", "_")
+                
+                order_prefix = view_order.get(item["car_view"], "0")
+                base_name = f"{order_prefix}_{safe_view}_{safe_part}_{safe_dmg}"
+                
+                # If same base_name already used, add index suffix
+                if base_name in used_filenames:
+                    used_filenames[base_name] += 1
+                    filename = f"{base_name}_{used_filenames[base_name]}.jpg"
+                else:
+                    used_filenames[base_name] = 1
+                    filename = f"{base_name}.jpg"
+                
+                if "raw_image" in item:
+                    cv2.imwrite(str(orig_dir / filename), item["raw_image"])
+                    del item["raw_image"]
+                
+                if "vis_image" in item:
+                    cv2.imwrite(str(anno_dir / filename), item["vis_image"])
+                    del item["vis_image"]
+                
+                # Remove internal centroid field before saving
+                item.pop("_rel_centroid", None)
+                item["image_filename"] = f"keyframes/original/{filename}"
 
-        print()  # Add a newline after the progress indicator finishes
-        cap.release()
-        if writer is not None:
-            writer.release()
-        log.info("Processed %d frames (of %d total).", processed, frame_idx)
+            log.info("Keyframe images saved -> %s (original & annotated)", keyframes_dir)
 
-        report = self.ledger.confirmed_report()
-        if out_report_path:
-            Path(out_report_path).write_text(json.dumps(report, indent=2))
-            log.info("Report saved -> %s", out_report_path)
+        # Generate clean report (without metadata)
+        clean_report = []
+        for item in report:
+            clean_report.append({
+                "part": item["part"],
+                "damage_type": item["damage_type"],
+                "car_view": item["car_view"],
+                "confidence": item["confidence"],
+                "severity": item["severity"],
+                "severity_ratio": item["severity_ratio"]
+            })
+
+        # Save standard concise JSON report
+        report_path = out_report_path or str(out_path / "damage_report.json")
+        Path(report_path).write_text(json.dumps(clean_report, indent=2))
+        log.info("Report saved -> %s", report_path)
+
+        # Save new metadata JSON report
+        metadata_path = str(out_path / "damage_metadata.json")
+        Path(metadata_path).write_text(json.dumps(report, indent=2))
+        log.info("Metadata saved -> %s", metadata_path)
+
         return report
 
 
@@ -535,7 +798,7 @@ class DamagePipeline:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Three-model car damage pipeline (video)")
+    ap = argparse.ArgumentParser(description="Two-pass keyframe car damage pipeline")
     ap.add_argument("video", help="Input video path")
     ap.add_argument("--angle-weights", default=str(MODEL_ANGLE_PATH),
                      help=f"Default: {MODEL_ANGLE_PATH}")
@@ -543,15 +806,21 @@ def main() -> None:
                      help=f"Default: {MODEL_PARTS_PATH}")
     ap.add_argument("--damage-weights", default=str(MODEL_DAMAGE_PATH),
                      help=f"Default: {MODEL_DAMAGE_PATH}")
-    ap.add_argument("--out-video", default="annotated_output.mp4")
-    ap.add_argument("--out-report", default="damage_report.json")
+    ap.add_argument("--out-dir", default="output",
+                     help="Directory for keyframe images and report (default: output/)")
+    ap.add_argument("--out-report", default=None,
+                     help="Path for JSON report (default: <out-dir>/damage_report.json)")
     ap.add_argument("--parts-conf", type=float, default=0.50)
     ap.add_argument("--damage-conf", type=float, default=0.60)
     ap.add_argument("--crop-strategy", choices=["bbox", "padded", "matte"], default="bbox")
-    ap.add_argument("--frame-skip", type=int, default=1)
-    ap.add_argument("--min-votes", type=int, default=4)
-    ap.add_argument("--min-vote-ratio", type=float, default=0.20)
+    ap.add_argument("--sample-every", type=int, default=1,
+                     help="Sample every Nth frame during angle scan (default: 1)")
+    ap.add_argument("--min-direction-frames", type=int, default=1,
+                     help="Minimum frames that must agree on a direction to confirm it (default: 1)")
+    ap.add_argument("--frames-per-direction", type=int, default=7,
+                     help="Number of frames to analyze per direction (default: 3)")
     ap.add_argument("--no-draw", action="store_true")
+    ap.add_argument("--no-save-keyframes", action="store_true")
     args = ap.parse_args()
 
     cfg = PipelineConfig(
@@ -561,20 +830,21 @@ def main() -> None:
         parts_conf=args.parts_conf,
         damage_conf=args.damage_conf,
         crop_strategy=args.crop_strategy,
-        frame_skip=args.frame_skip,
-        min_votes=args.min_votes,
-        min_vote_ratio=args.min_vote_ratio,
+        sample_every_n=args.sample_every,
+        min_direction_frames=args.min_direction_frames,
+        frames_per_direction=args.frames_per_direction,
         draw=not args.no_draw,
+        save_keyframes=not args.no_save_keyframes,
     )
 
     pipeline = DamagePipeline(cfg)
-    report = pipeline.run_on_video(args.video, args.out_video, args.out_report)
+    report = pipeline.run_on_video(args.video, args.out_dir, args.out_report)
 
     print("\n" + "=" * 100)
-    print("CONFIRMED DAMAGE REPORT")
+    print("DAMAGE REPORT")
     print("=" * 100)
     if not report:
-        print("No confirmed damage.")
+        print("No damage detected.")
     for item in report:
         print(f"  {item['part']:<18} {item['damage_type']:<14} view={item['car_view']:<18} "
               f"conf={item['confidence']:.2f}  severity={item['severity']} "
