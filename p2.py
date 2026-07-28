@@ -58,7 +58,7 @@ class PipelineConfig:
     #   "matte"  -> bbox crop with everything outside the part mask blacked out,
     #               forces the damage model to focus on the panel and ignore
     #               whatever the parts model over-included in the box
-    crop_strategy: str = "matte"
+    crop_strategy: str = "bbox"
     crop_padding_ratio: float = 0.08  # only used by "padded"
 
     # How often to sample frames during the angle-scan pass.
@@ -284,10 +284,11 @@ def build_crop(frame: np.ndarray, part: PartBox, cfg: PipelineConfig) -> Tuple[n
 # PART RE-ATTRIBUTION — which part does a damage box really belong to?
 # ═══════════════════════════════════════════════════════════════════════════
 
-def reattribute(dmg: DamageBox, origin: Tuple[int, int], parts: List[PartBox], fallback: PartBox) -> PartBox:
+def reattribute(dmg: DamageBox, origin: Tuple[int, int], parts: List[PartBox]) -> Optional[PartBox]:
     """Re-attribute damage to whichever detected part's mask or bounding box
     actually contains/overlaps the damage best in frame coordinates, provided
-    the damage type is allowed on that target part."""
+    the damage type is allowed on that target part.
+    If the damage physically lies far outside any allowed/detected part, returns None."""
     ox, oy = origin
     dx1, dy1, dx2, dy2 = dmg.xyxy_in_crop
     fx1, fy1, fx2, fy2 = ox + dx1, oy + dy1, ox + dx2, oy + dy2
@@ -327,13 +328,12 @@ def reattribute(dmg: DamageBox, origin: Tuple[int, int], parts: List[PartBox], f
             best_score = score
             best_part = p
 
-    if best_part is not None and best_score >= -30.0:
+    # If the damage center is within ~5 pixels of the best valid part, accept it.
+    if best_part is not None and best_score >= -5.0:
         return best_part
 
-    if dmg.dtype in DAMAGE_ALLOWED_ON_PART.get(fallback.name, []):
-        return fallback
-
-    return fallback
+    # Otherwise, it does not physically belong to ANY detected/allowed part in this view.
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -347,6 +347,7 @@ class Keyframe:
     frame: np.ndarray
     confidence: float
     frame_idx: int
+    timestamp_seconds: float = 0.0
 
 
 class DamagePipeline:
@@ -374,6 +375,7 @@ class DamagePipeline:
             raise RuntimeError(f"Cannot open video: {video_path}")
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
 
         # Collect every candidate: direction -> list of (conf, frame_idx, frame)
         candidates: Dict[str, List[Tuple[float, int, np.ndarray]]] = defaultdict(list)
@@ -421,7 +423,8 @@ class DamagePipeline:
             selected = self._pick_spread_frames(entries, n_pick)
             confirmed[direction] = [
                 Keyframe(direction=direction, frame=frm,
-                         confidence=conf, frame_idx=fidx)
+                         confidence=conf, frame_idx=fidx,
+                         timestamp_seconds=round(fidx / fps, 2))
                 for conf, fidx, frm in selected
             ]
 
@@ -475,23 +478,36 @@ class DamagePipeline:
 
     # ── Pass 2: Run parts + damage on selected keyframes ─────────────────
 
-    def _draw_damage(self, vis: np.ndarray, dmg: DamageBox, origin: Tuple[int, int],
-                      fallback_box: Tuple[int, int, int, int], part_name: str) -> None:
+    def _draw_part(self, vis: np.ndarray, part: PartBox) -> None:
+        """Render car part as a polyline segmentation outline if available, falling back to box."""
+        if part.mask_xy is not None and part.mask_xy.size >= 6:
+            cv2.polylines(vis, [part.mask_xy], isClosed=True, color=(255, 180, 0), thickness=2)
+            label_x = int(part.mask_xy[:, 0].min())
+            label_y = int(part.mask_xy[:, 1].min())
+        else:
+            px1, py1, px2, py2 = part.xyxy
+            cv2.rectangle(vis, (px1, py1), (px2, py2), (255, 180, 0), 1)
+            label_x, label_y = px1, py1
+
+        cv2.putText(vis, part.name, (label_x, max(15, label_y - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 180, 0), 1)
+
+    def _draw_damage(self, vis: np.ndarray, part_name: str, dtype: str, conf: float,
+                      poly_str: Optional[str], bbox: Tuple[int, int, int, int]) -> None:
         """Render damage as a filled, semi-transparent segmentation mask."""
-        ox, oy = origin
-        if dmg.mask_in_crop is not None and dmg.mask_in_crop.size >= 6:
-            poly = (dmg.mask_in_crop + np.array([ox, oy])).astype(np.int32)
+        if poly_str:
+            poly = np.array(list(map(float, poly_str.split()))).reshape(-1, 2).astype(np.int32)
             overlay = vis.copy()
             cv2.fillPoly(overlay, [poly], (0, 0, 255))
             cv2.polylines(vis, [poly], isClosed=True, color=(0, 0, 255), thickness=2)
             cv2.addWeighted(overlay, 0.40, vis, 0.60, 0, vis)
             label_x, label_y = poly[:, 0].min(), poly[:, 1].min()
         else:
-            dx1, dy1, dx2, dy2 = fallback_box
-            cv2.rectangle(vis, (ox + dx1, oy + dy1), (ox + dx2, oy + dy2), (0, 0, 255), 2)
-            label_x, label_y = ox + dx1, oy + dy1
+            dx1, dy1, dx2, dy2 = bbox
+            cv2.rectangle(vis, (dx1, dy1), (dx2, dy2), (0, 0, 255), 2)
+            label_x, label_y = dx1, dy1
 
-        cv2.putText(vis, f"{part_name}:{dmg.dtype} {dmg.conf:.2f}",
+        cv2.putText(vis, f"{part_name}:{dtype} {conf:.2f}",
                     (int(label_x), max(15, int(label_y) - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
 
@@ -542,23 +558,51 @@ class DamagePipeline:
 
                     for dmg in self.damage.infer(crop, allowed_dmg, self.cfg.damage_conf):
                         dx1, dy1, dx2, dy2 = dmg.xyxy_in_crop
-                        target = reattribute(dmg, origin=(ox, oy), parts=detected_parts, fallback=part)
-
-                        # Compute severity from damage area vs part area
-                        if dmg.mask_in_crop is not None and dmg.mask_in_crop.size >= 6:
-                            damage_area = float(cv2.contourArea(dmg.mask_in_crop.astype(np.float32)))
-                        else:
-                            damage_area = float((dx2 - dx1) * (dy2 - dy1))
-
-                        sev_ratio = damage_area / target.area_px if target.area_px > 0 else 0.0
+                        target = reattribute(dmg, origin=(ox, oy), parts=detected_parts)
+                        if target is None:
+                            continue
 
                         # Translate damage bbox back to full-frame coordinates
                         fx1, fy1, fx2, fy2 = ox + dx1, oy + dy1, ox + dx2, oy + dy2
-                        
+
                         damage_poly_str = None
                         if dmg.mask_in_crop is not None and dmg.mask_in_crop.size >= 6:
                             poly = (dmg.mask_in_crop + np.array([ox, oy])).astype(np.int32)
+                            
+                            # COOKIE-CUTTER: Trim the damage polygon to the target part's polygon
+                            if target.mask_xy is not None and target.mask_xy.size >= 6:
+                                h, w = frame.shape[:2]
+                                dmg_canvas = np.zeros((h, w), dtype=np.uint8)
+                                part_canvas = np.zeros((h, w), dtype=np.uint8)
+                                cv2.fillPoly(dmg_canvas, [poly], 255)
+                                cv2.fillPoly(part_canvas, [target.mask_xy], 255)
+                                
+                                intersection = cv2.bitwise_and(dmg_canvas, part_canvas)
+                                contours, _ = cv2.findContours(intersection, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                
+                                if contours:
+                                    best_contour = max(contours, key=cv2.contourArea)
+                                    if len(best_contour) >= 3:
+                                        poly = best_contour.reshape(-1, 2)
+                                        # Update the damage bbox to match the new trimmed mask
+                                        x, y, w_box, h_box = cv2.boundingRect(poly)
+                                        fx1, fy1, fx2, fy2 = x, y, x + w_box, y + h_box
+                                    else:
+                                        continue  # Intersection was just a tiny sliver, ignore this damage
+                                else:
+                                    continue  # Damage is completely outside the part's polygon
+                                    
+                            damage_area = float(cv2.contourArea(poly.astype(np.float32)))
                             damage_poly_str = " ".join(map(str, poly.reshape(-1).tolist()))
+                        else:
+                            damage_area = float((fx2 - fx1) * (fy2 - fy1))
+                            
+                        # Compute severity from (possibly trimmed) damage area vs part area
+                        sev_ratio = damage_area / target.area_px if target.area_px > 0 else 0.0
+
+                        part_poly_str = None
+                        if target.mask_xy is not None and target.mask_xy.size >= 6:
+                            part_poly_str = " ".join(map(str, target.mask_xy.reshape(-1).tolist()))
 
                         # Compute relative centroid of damage within the part bbox
                         px1, py1, px2, py2 = target.xyxy
@@ -577,22 +621,22 @@ class DamagePipeline:
                             "severity": severity_for(sev_ratio),
                             "severity_ratio": round(sev_ratio, 4),
                             "frame_index": kf.frame_idx,
+                            "timestamp_seconds": kf.timestamp_seconds,
+                            "part_bbox": " ".join(map(str, target.xyxy)),
+                            "part_polygon": part_poly_str,
                             "damage_bbox": " ".join(map(str, [fx1, fy1, fx2, fy2])),
                             "damage_polygon": damage_poly_str,
                             "_rel_centroid": (rel_cx, rel_cy)
                         }
 
                         if self.cfg.draw:
-                            # Create a fresh copy of the frame to draw ONLY this part's damage
+                            # Create a fresh copy of the frame to draw target part + damage
                             part_vis = frame.copy()
-                            self._draw_damage(part_vis, dmg, origin=(ox, oy),
-                                              fallback_box=(dx1, dy1, dx2, dy2),
-                                              part_name=target.name)
-                            # Draw the bounding box for the target part
-                            px1, py1, px2, py2 = target.xyxy
-                            cv2.rectangle(part_vis, (px1, py1), (px2, py2), (255, 180, 0), 1)
-                            cv2.putText(part_vis, target.name, (px1, max(15, py1 - 4)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 180, 0), 1)
+                            # 1. Draw target car part segmentation mask (orange/amber)
+                            self._draw_part(part_vis, target)
+                            # 2. Draw damage segmentation mask on top (red)
+                            self._draw_damage(part_vis, target.name, dmg.dtype, dmg.conf,
+                                              hit["damage_polygon"], (fx1, fy1, fx2, fy2))
                             cv2.putText(part_vis, f"view: {direction}  (frame #{kf.frame_idx})",
                                         (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
                             hit["vis_image"] = part_vis
@@ -650,30 +694,35 @@ class DamagePipeline:
 
     @staticmethod
     def _dedup_cross_view_hits(hits: List[Dict], centroid_threshold: float = 0.25) -> List[Dict]:
-        """Deduplicate damage detections across adjacent views for singular car parts.
+        """Deduplicate damage detections across adjacent views for all car parts.
 
-        For singular parts (Front-bumper, Hood, etc.), if the same damage type is detected
-        from adjacent or transitively-adjacent views (e.g. back-right-side → back → back-left-side),
-        keeps the entry with higher confidence only if their relative centroids are within
-        the threshold.  Uses a lenient threshold (0.50) because camera angle changes cause
-        the relative centroid to drift naturally.
-        Paired parts (doors, wheels) on left vs right sides are left separate.
+        For singular parts (Front-bumper, Hood, etc.), views like front-right-side and front-left-side
+        can share the same part via 'front' (transitively adjacent).
+        For side parts (Fender, Doors), adjacent views (e.g. front-right-side and right-side)
+        share the exact same physical panel.
         """
         # Build transitive adjacency: views that can "see" the same singular part
-        # e.g. back-right-side, back, back-left-side can all see Back-bumper
         SINGULAR_VIEW_GROUPS = [
             {"front", "front-left-side", "front-right-side"},
             {"back", "back-left-side", "back-right-side"},
         ]
 
-        def views_can_share_singular(v1: str, v2: str) -> bool:
-            """True if v1 and v2 belong to the same singular-part viewing group,
-            OR are directly adjacent."""
-            for group in SINGULAR_VIEW_GROUPS:
-                if v1 in group and v2 in group:
-                    return True
-            adj = VIEW_ADJACENCY.get(v1, set()) | {v1}
-            return v2 in adj
+        def views_can_share(v1: str, v2: str, part_name: str) -> bool:
+            """True if v1 and v2 see the SAME physical instance of `part_name`."""
+            if v1 == v2:
+                return True
+            
+            # If they are directly adjacent, they see the same side panel
+            adj = VIEW_ADJACENCY.get(v1, set())
+            if v2 in adj:
+                return True
+                
+            # For singular parts, they can be shared across transitive adjacent views
+            if part_name in SINGULAR_PARTS:
+                for group in SINGULAR_VIEW_GROUPS:
+                    if v1 in group and v2 in group:
+                        return True
+            return False
 
         kept: List[Dict] = []
         for hit in sorted(hits, key=lambda h: h["confidence"], reverse=True):
@@ -682,18 +731,17 @@ class DamagePipeline:
             view = hit["car_view"]
             cx, cy = hit.get("_rel_centroid", (0.5, 0.5))
 
-            if part in SINGULAR_PARTS:
-                is_dup = False
-                for k in kept:
-                    if k["part"] == part and k["damage_type"] == dtype and views_can_share_singular(view, k["car_view"]):
-                        kx, ky = k.get("_rel_centroid", (0.5, 0.5))
-                        dist = ((cx - kx) ** 2 + (cy - ky) ** 2) ** 0.5
-                        if dist < centroid_threshold:
-                            is_dup = True
-                            break
-                if is_dup:
-                    continue
-            kept.append(hit)
+            is_dup = False
+            for k in kept:
+                if k["part"] == part and k["damage_type"] == dtype and views_can_share(view, k["car_view"], part):
+                    kx, ky = k.get("_rel_centroid", (0.5, 0.5))
+                    dist = ((cx - kx) ** 2 + (cy - ky) ** 2) ** 0.5
+                    if dist < centroid_threshold:
+                        is_dup = True
+                        break
+            
+            if not is_dup:
+                kept.append(hit)
         return kept
 
     # ── Main entry point ─────────────────────────────────────────────────
@@ -765,6 +813,7 @@ class DamagePipeline:
                 # Remove internal centroid field before saving
                 item.pop("_rel_centroid", None)
                 item["image_filename"] = f"keyframes/original/{filename}"
+                item["annotated_image_filename"] = f"keyframes/annotated/{filename}"
 
             log.info("Keyframe images saved -> %s (original & annotated)", keyframes_dir)
 
@@ -780,14 +829,39 @@ class DamagePipeline:
                 "severity_ratio": item["severity_ratio"]
             })
 
+        import datetime
+        severity_rank = {"Minor": 1, "Moderate": 2, "Severe": 3}
+        highest_sev = "None"
+        if report:
+            highest_sev = max((item["severity"] for item in report), key=lambda s: severity_rank.get(s, 0))
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        video_name = Path(video_path).name
+
+        summary_clean = {
+            "video_filename": video_name,
+            "total_damages_found": len(clean_report),
+            "highest_severity": highest_sev,
+            "processing_timestamp": now_iso,
+            "damages": clean_report
+        }
+
+        summary_meta = {
+            "video_filename": video_name,
+            "total_damages_found": len(report),
+            "highest_severity": highest_sev,
+            "processing_timestamp": now_iso,
+            "damages": report
+        }
+
         # Save standard concise JSON report
         report_path = out_report_path or str(out_path / "damage_report.json")
-        Path(report_path).write_text(json.dumps(clean_report, indent=2))
+        Path(report_path).write_text(json.dumps(summary_clean, indent=2))
         log.info("Report saved -> %s", report_path)
 
         # Save new metadata JSON report
         metadata_path = str(out_path / "damage_metadata.json")
-        Path(metadata_path).write_text(json.dumps(report, indent=2))
+        Path(metadata_path).write_text(json.dumps(summary_meta, indent=2))
         log.info("Metadata saved -> %s", metadata_path)
 
         return report
@@ -838,7 +912,13 @@ def main() -> None:
     )
 
     pipeline = DamagePipeline(cfg)
-    report = pipeline.run_on_video(args.video, args.out_dir, args.out_report)
+    
+    # Create a unique subfolder for this video to prevent overwriting
+    from pathlib import Path
+    video_stem = Path(args.video).stem
+    out_dir_for_video = str(Path(args.out_dir) / f"{video_stem}_results")
+    
+    report = pipeline.run_on_video(args.video, out_dir_for_video, args.out_report)
 
     print("\n" + "=" * 100)
     print("DAMAGE REPORT")
