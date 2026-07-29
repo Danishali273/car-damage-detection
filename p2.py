@@ -5,13 +5,13 @@ Instead of processing every frame with all three models and voting,
 this pipeline uses a fast two-pass strategy:
 
     Pass 1 (fast):   Scan video with the angle classifier only.
-                     Pick the single best frame per direction (8 directions).
+                     Pick the top N best frames per direction (up to 8 directions).
 
     Pass 2 (targeted): Run parts segmentation + damage detection on
-                       only those ~8 keyframes.
+                       only those keyframes.
 
 Result: ~10-50× faster than frame-by-frame, with cleaner results
-since each direction gets a deliberately-selected, high-quality frame.
+since each direction gets deliberately-selected, high-quality frames.
 """
 
 from __future__ import annotations
@@ -54,12 +54,10 @@ class PipelineConfig:
 
     # How crops are built before being handed to the damage model.
     #   "bbox"   -> raw axis-aligned crop (original behaviour)
-    #   "padded" -> bbox crop + a margin, matches loosely-annotated training data better
     #   "matte"  -> bbox crop with everything outside the part mask blacked out,
     #               forces the damage model to focus on the panel and ignore
     #               whatever the parts model over-included in the box
     crop_strategy: str = "bbox"
-    crop_padding_ratio: float = 0.08  # only used by "padded"
 
     # How often to sample frames during the angle-scan pass.
     # E.g. 5 means check every 5th frame for direction classification.
@@ -73,8 +71,8 @@ class PipelineConfig:
 
     # How many frames to analyze per confirmed direction.
     # More frames = better coverage (catches damage missed by one angle),
-    # but slightly slower.  E.g. 3 means ~24 total frames across 8 directions.
-    frames_per_direction: int = 5
+    # but slightly slower.  E.g. 7 means ~56 total frames across 8 directions.
+    frames_per_direction: int = 7
 
     # Save the selected keyframe images to disk for inspection.
     save_keyframes: bool = True
@@ -260,13 +258,6 @@ def build_crop(frame: np.ndarray, part: PartBox, cfg: PipelineConfig) -> Tuple[n
     """Return (crop_image, (origin_x, origin_y)) for damage inference."""
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = part.xyxy
-
-    if cfg.crop_strategy == "padded":
-        pad_x = int((x2 - x1) * cfg.crop_padding_ratio)
-        pad_y = int((y2 - y1) * cfg.crop_padding_ratio)
-        x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
-        x2, y2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
-        return frame[y1:y2, x1:x2], (x1, y1)
 
     if cfg.crop_strategy == "matte" and part.mask_xy is not None and part.mask_xy.size >= 6:
         crop = frame[y1:y2, x1:x2].copy()
@@ -516,7 +507,7 @@ class DamagePipeline:
 
         Processes every selected frame, then deduplicates: if the same
         (part, damage_type) is found on multiple frames of the same
-        direction, only the highest-confidence hit is kept.
+        direction and they are physically close, only the highest-confidence hit is kept.
 
         Returns a list of raw damage hits (with 'vis_image' attached if drawing is enabled).
         """
@@ -886,13 +877,13 @@ def main() -> None:
                      help="Path for JSON report (default: <out-dir>/damage_report.json)")
     ap.add_argument("--parts-conf", type=float, default=0.50)
     ap.add_argument("--damage-conf", type=float, default=0.60)
-    ap.add_argument("--crop-strategy", choices=["bbox", "padded", "matte"], default="bbox")
+    ap.add_argument("--crop-strategy", choices=["bbox", "matte"], default="bbox")
     ap.add_argument("--sample-every", type=int, default=1,
                      help="Sample every Nth frame during angle scan (default: 1)")
     ap.add_argument("--min-direction-frames", type=int, default=1,
                      help="Minimum frames that must agree on a direction to confirm it (default: 1)")
     ap.add_argument("--frames-per-direction", type=int, default=7,
-                     help="Number of frames to analyze per direction (default: 3)")
+                     help="Number of frames to analyze per direction (default: 7)")
     ap.add_argument("--no-draw", action="store_true")
     ap.add_argument("--no-save-keyframes", action="store_true")
     args = ap.parse_args()

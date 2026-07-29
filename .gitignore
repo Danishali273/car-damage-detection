@@ -18,3 +18,5 @@
 *.wmv
 *.flv
 *.webm
+
+__pycache__/
