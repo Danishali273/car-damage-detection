@@ -20,3 +20,4 @@
 *.webm
 
 __pycache__/
+venv

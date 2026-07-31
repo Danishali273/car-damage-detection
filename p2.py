@@ -684,7 +684,7 @@ class DamagePipeline:
         return result
 
     @staticmethod
-    def _dedup_cross_view_hits(hits: List[Dict], centroid_threshold: float = 0.25) -> List[Dict]:
+    def _dedup_cross_view_hits(hits: List[Dict], centroid_threshold: float = 0.50) -> List[Dict]:
         """Deduplicate damage detections across adjacent views for all car parts.
 
         For singular parts (Front-bumper, Hood, etc.), views like front-right-side and front-left-side
@@ -882,8 +882,8 @@ def main() -> None:
                      help="Sample every Nth frame during angle scan (default: 1)")
     ap.add_argument("--min-direction-frames", type=int, default=1,
                      help="Minimum frames that must agree on a direction to confirm it (default: 1)")
-    ap.add_argument("--frames-per-direction", type=int, default=7,
-                     help="Number of frames to analyze per direction (default: 7)")
+    ap.add_argument("--frames-per-direction", type=int, default=5,
+                     help="Number of frames to analyze per direction (default: 5)")
     ap.add_argument("--no-draw", action="store_true")
     ap.add_argument("--no-save-keyframes", action="store_true")
     args = ap.parse_args()
