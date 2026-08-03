@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from tqdm import tqdm
 from ultralytics import YOLO
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -373,12 +374,22 @@ class DamagePipeline:
 
         frame_idx = 0
         scanned = 0
+
+        pbar = tqdm(
+            total=total_frames if total_frames > 0 else None,
+            desc="[Pass 1] Scanning frames",
+            unit="frame",
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}",
+        )
+
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             frame_idx += 1
             if frame_idx % self.cfg.sample_every_n != 0:
+                pbar.update(1)
                 continue
 
             raw_view, conf = self.angle.infer(frame)
@@ -386,16 +397,10 @@ class DamagePipeline:
             scanned += 1
 
             candidates[car_direction].append((conf, frame_idx, frame.copy()))
+            pbar.update(1)
+            pbar.set_postfix_str(f"{len(candidates)} dirs seen", refresh=False)
 
-            if total_frames > 0:
-                print(f"\r[Pass 1] Scanning frame {frame_idx}/{total_frames} "
-                      f"({(frame_idx / total_frames) * 100:.1f}%) — "
-                      f"{len(candidates)} directions seen" + " " * 15, end="", flush=True)
-            else:
-                print(f"\r[Pass 1] Scanning frame {frame_idx}… — "
-                      f"{len(candidates)} directions seen" + " " * 15, end="", flush=True)
-
-        print()
+        pbar.close()
         cap.release()
 
         # Filter + select top N frames per confirmed direction
@@ -513,16 +518,22 @@ class DamagePipeline:
         """
         report: List[Dict] = []
         total_frames = sum(len(kfs) for kfs in keyframes.values())
-        processed = 0
+
+        pbar = tqdm(
+            total=total_frames,
+            desc="[Pass 2] Analyzing keyframes",
+            unit="frame",
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]{postfix}",
+        )
 
         for direction, kf_list in sorted(keyframes.items()):
             # Per-direction raw hits (before dedup)
             dir_hits: List[Dict] = []
 
             for kf in kf_list:
-                processed += 1
-                print(f"\r[Pass 2] Analyzing {direction} frame #{kf.frame_idx} "
-                      f"({processed}/{total_frames})…" + " " * 20, end="", flush=True)
+                pbar.update(1)
+                pbar.set_postfix_str(f"{direction} #{kf.frame_idx}", refresh=False)
 
                 frame = kf.frame
                 allowed_parts = PARTS_VISIBLE_FROM.get(direction, [])
@@ -639,7 +650,7 @@ class DamagePipeline:
             deduped = self._dedup_direction_hits(dir_hits)
             report.extend(deduped)
 
-        print()
+        pbar.close()
         return report
 
     @staticmethod
@@ -882,7 +893,7 @@ def main() -> None:
                      help="Sample every Nth frame during angle scan (default: 1)")
     ap.add_argument("--min-direction-frames", type=int, default=1,
                      help="Minimum frames that must agree on a direction to confirm it (default: 1)")
-    ap.add_argument("--frames-per-direction", type=int, default=5,
+    ap.add_argument("--frames-per-direction", type=int, default=7,
                      help="Number of frames to analyze per direction (default: 5)")
     ap.add_argument("--no-draw", action="store_true")
     ap.add_argument("--no-save-keyframes", action="store_true")
