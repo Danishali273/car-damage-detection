@@ -50,14 +50,11 @@ class PipelineConfig:
     parts_model_path: str = str(MODEL_PARTS_PATH)
     damage_model_path: str = str(MODEL_DAMAGE_PATH)
 
-    parts_conf: float = 0.50
+    parts_conf: float = 0.60
     damage_conf: float = 0.60
 
     # How crops are built before being handed to the damage model.
     #   "bbox"   -> raw axis-aligned crop (original behaviour)
-    #   "matte"  -> bbox crop with everything outside the part mask blacked out,
-    #               forces the damage model to focus on the panel and ignore
-    #               whatever the parts model over-included in the box
     crop_strategy: str = "bbox"
 
     # How often to sample frames during the angle-scan pass.
@@ -80,6 +77,11 @@ class PipelineConfig:
 
     draw: bool = True
 
+    # Minimum Laplacian variance (sharpness) for a frame to be considered
+    # as a keyframe candidate.  Frames below this are blurry / out-of-focus
+    # and will produce poor segmentation masks.  Set to 0 to disable.
+    min_sharpness: float = 50.0
+
 
 # Camera-view -> car-centric direction. The classifier looks *at* the car;
 # this remaps to how the car itself is oriented.
@@ -96,13 +98,13 @@ CAMERA_TO_CAR_DIRECTION: Dict[str, str] = {
 
 PARTS_VISIBLE_FROM: Dict[str, List[str]] = {
     "front": ["Front-bumper", "Headlight", "Hood", "Windshield"],
-    "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield"],
-    "left-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
-    "right-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
     "front-left-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield"],
     "front-right-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield"],
+    "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield"],
     "back-left-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
     "back-right-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
+    "left-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
+    "right-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
 }
 
 DAMAGE_ALLOWED_ON_PART: Dict[str, List[str]] = {
@@ -140,6 +142,16 @@ def severity_for(ratio: float) -> str:
         if ratio <= cutoff:
             return label
     return "Severe"
+
+
+def calculate_sharpness(frame: np.ndarray) -> float:
+    """Return Laplacian variance as a sharpness score.
+
+    Higher = sharper.  Blurry / motion-blurred frames typically score < 50,
+    while in-focus frames score 100+.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -336,10 +348,10 @@ def reattribute(dmg: DamageBox, origin: Tuple[int, int], parts: List[PartBox]) -
 class Keyframe:
     """A selected frame for one direction."""
     direction: str
-    frame: np.ndarray
     confidence: float
     frame_idx: int
     timestamp_seconds: float = 0.0
+    frame: Optional[np.ndarray] = None  # Loaded lazily to save memory
 
 
 class DamagePipeline:
@@ -369,8 +381,8 @@ class DamagePipeline:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
 
-        # Collect every candidate: direction -> list of (conf, frame_idx, frame)
-        candidates: Dict[str, List[Tuple[float, int, np.ndarray]]] = defaultdict(list)
+        # Collect every candidate: direction -> list of (conf, frame_idx)
+        candidates: Dict[str, List[Tuple[float, int]]] = defaultdict(list)
 
         frame_idx = 0
         scanned = 0
@@ -396,7 +408,14 @@ class DamagePipeline:
             car_direction = CAMERA_TO_CAR_DIRECTION.get(raw_view, raw_view)
             scanned += 1
 
-            candidates[car_direction].append((conf, frame_idx, frame.copy()))
+            # Quality gate: skip blurry / out-of-focus frames
+            if self.cfg.min_sharpness > 0:
+                sharpness = calculate_sharpness(frame)
+                if sharpness < self.cfg.min_sharpness:
+                    pbar.update(1)
+                    continue
+
+            candidates[car_direction].append((conf, frame_idx))
             pbar.update(1)
             pbar.set_postfix_str(f"{len(candidates)} dirs seen", refresh=False)
 
@@ -418,10 +437,10 @@ class DamagePipeline:
             # Select top N frames, spread apart in time
             selected = self._pick_spread_frames(entries, n_pick)
             confirmed[direction] = [
-                Keyframe(direction=direction, frame=frm,
+                Keyframe(direction=direction,
                          confidence=conf, frame_idx=fidx,
                          timestamp_seconds=round(fidx / fps, 2))
-                for conf, fidx, frm in selected
+                for conf, fidx in selected
             ]
 
         log.info("Pass 1 done: scanned %d frames, confirmed %d/%d directions "
@@ -436,8 +455,8 @@ class DamagePipeline:
 
     @staticmethod
     def _pick_spread_frames(
-        entries: List[Tuple[float, int, np.ndarray]], n: int
-    ) -> List[Tuple[float, int, np.ndarray]]:
+        entries: List[Tuple[float, int]], n: int
+    ) -> List[Tuple[float, int]]:
         """Pick up to `n` frames from `entries`, preferring high confidence
         while spreading them apart in time so we don't get N near-identical
         frames from the same moment."""
@@ -448,7 +467,7 @@ class DamagePipeline:
         by_conf = sorted(entries, key=lambda e: e[0], reverse=True)
 
         # Greedily pick frames that are temporally spread apart
-        selected: List[Tuple[float, int, np.ndarray]] = []
+        selected: List[Tuple[float, int]] = []
         # Minimum frame gap: total span / (n+1) so they're spaced out
         frame_indices = [e[1] for e in entries]
         span = max(frame_indices) - min(frame_indices)
@@ -471,6 +490,42 @@ class DamagePipeline:
                     selected.append(entry)
 
         return selected
+
+    # ── Load keyframe pixels from video (lazy retrieval) ─────────────────
+
+    def _load_keyframe_pixels(self, video_path: str, keyframes: Dict[str, List[Keyframe]]) -> None:
+        """Re-open the video and read only the selected keyframe pixels.
+
+        This avoids storing all scanned frames in memory during Pass 1.
+        Frames are read in ascending index order for sequential I/O.
+        """
+        idx_to_keyframes: Dict[int, List[Keyframe]] = defaultdict(list)
+        for kf_list in keyframes.values():
+            for kf in kf_list:
+                idx_to_keyframes[kf.frame_idx].append(kf)
+
+        if not idx_to_keyframes:
+            return
+
+        sorted_indices = sorted(idx_to_keyframes.keys())
+        log.info("Loading %d keyframe pixels from video …", len(sorted_indices))
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot re-open video for keyframe loading: {video_path}")
+
+        for target_idx in sorted_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx - 1)  # 0-based seek
+            ok, frame = cap.read()
+            if not ok:
+                log.warning("Failed to read frame #%d from video", target_idx)
+                continue
+            # Multiple keyframes may share the same frame index
+            for kf in idx_to_keyframes[target_idx]:
+                kf.frame = frame.copy()
+
+        cap.release()
+        log.info("Keyframe pixels loaded.")
 
     # ── Pass 2: Run parts + damage on selected keyframes ─────────────────
 
@@ -570,7 +625,7 @@ class DamagePipeline:
                         damage_poly_str = None
                         if dmg.mask_in_crop is not None and dmg.mask_in_crop.size >= 6:
                             poly = (dmg.mask_in_crop + np.array([ox, oy])).astype(np.int32)
-                            
+
                             # COOKIE-CUTTER: Trim the damage polygon to the target part's polygon
                             if target.mask_xy is not None and target.mask_xy.size >= 6:
                                 h, w = frame.shape[:2]
@@ -578,10 +633,10 @@ class DamagePipeline:
                                 part_canvas = np.zeros((h, w), dtype=np.uint8)
                                 cv2.fillPoly(dmg_canvas, [poly], 255)
                                 cv2.fillPoly(part_canvas, [target.mask_xy], 255)
-                                
+
                                 intersection = cv2.bitwise_and(dmg_canvas, part_canvas)
                                 contours, _ = cv2.findContours(intersection, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                
+
                                 if contours:
                                     best_contour = max(contours, key=cv2.contourArea)
                                     if len(best_contour) >= 3:
@@ -593,12 +648,12 @@ class DamagePipeline:
                                         continue  # Intersection was just a tiny sliver, ignore this damage
                                 else:
                                     continue  # Damage is completely outside the part's polygon
-                                    
+
                             damage_area = float(cv2.contourArea(poly.astype(np.float32)))
                             damage_poly_str = " ".join(map(str, poly.reshape(-1).tolist()))
                         else:
                             damage_area = float((fx2 - fx1) * (fy2 - fy1))
-                            
+
                         # Compute severity from (possibly trimmed) damage area vs part area
                         sev_ratio = damage_area / target.area_px if target.area_px > 0 else 0.0
 
@@ -751,11 +806,14 @@ class DamagePipeline:
     def run_on_video(self, video_path: str, out_dir: str, out_report_path: Optional[str]) -> List[Dict]:
         """Two-pass pipeline: scan → select keyframes → analyze → report."""
 
-        # Pass 1: fast angle-only scan
+        # Pass 1: fast angle-only scan (stores only metadata, no pixels)
         keyframes = self.scan_video(video_path)
         if not keyframes:
             log.warning("No directions found in video!")
             return []
+
+        # Load pixels for selected keyframes only (memory-efficient)
+        self._load_keyframe_pixels(video_path, keyframes)
 
         # Pass 2: targeted parts + damage analysis on all selected frames
         raw_report = self.analyze_keyframes(keyframes)
@@ -775,26 +833,18 @@ class DamagePipeline:
             orig_dir.mkdir(parents=True, exist_ok=True)
             anno_dir.mkdir(parents=True, exist_ok=True)
             
-            # Clockwise mapping for easy file sorting
-            view_order = {
-                "front": "1",
-                "front-right-side": "2",
-                "right-side": "3",
-                "back-right-side": "4",
-                "back": "5",
-                "back-left-side": "6",
-                "left-side": "7",
-                "front-left-side": "8"
-            }
+            # Sort report by frame index (ascending) so files are numbered
+            # in the order frames appear in the video.
+            report.sort(key=lambda h: h.get("frame_index", 0))
             
             used_filenames: Dict[str, int] = {}
-            for item in report:
+            for seq_num, item in enumerate(report, start=1):
                 safe_part = item["part"].replace(" ", "_")
                 safe_dmg = item["damage_type"].replace(" ", "_")
                 safe_view = item["car_view"].replace(" ", "_")
                 
-                order_prefix = view_order.get(item["car_view"], "0")
-                base_name = f"{order_prefix}_{safe_view}_{safe_part}_{safe_dmg}"
+                order_prefix = str(seq_num).zfill(3)  # e.g. 001, 002, …
+                base_name = f"{order_prefix}_frame{item.get('frame_index', 0)}_{safe_view}_{safe_part}_{safe_dmg}"
                 
                 # If same base_name already used, add index suffix
                 if base_name in used_filenames:
@@ -886,7 +936,7 @@ def main() -> None:
                      help="Directory for keyframe images and report (default: output/)")
     ap.add_argument("--out-report", default=None,
                      help="Path for JSON report (default: <out-dir>/damage_report.json)")
-    ap.add_argument("--parts-conf", type=float, default=0.50)
+    ap.add_argument("--parts-conf", type=float, default=0.60)
     ap.add_argument("--damage-conf", type=float, default=0.60)
     ap.add_argument("--crop-strategy", choices=["bbox", "matte"], default="bbox")
     ap.add_argument("--sample-every", type=int, default=1,
@@ -897,6 +947,8 @@ def main() -> None:
                      help="Number of frames to analyze per direction (default: 5)")
     ap.add_argument("--no-draw", action="store_true")
     ap.add_argument("--no-save-keyframes", action="store_true")
+    ap.add_argument("--min-sharpness", type=float, default=50.0,
+                     help="Min Laplacian variance to accept a frame (0 = disabled, default: 50.0)")
     args = ap.parse_args()
 
     cfg = PipelineConfig(
@@ -911,6 +963,7 @@ def main() -> None:
         frames_per_direction=args.frames_per_direction,
         draw=not args.no_draw,
         save_keyframes=not args.no_save_keyframes,
+        min_sharpness=args.min_sharpness,
     )
 
     pipeline = DamagePipeline(cfg)
