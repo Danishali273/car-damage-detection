@@ -103,20 +103,29 @@ PARTS_VISIBLE_FROM: Dict[str, List[str]] = {
     "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield"],
     "back-left-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
     "back-right-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
-    "left-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
-    "right-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
+    "left-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window", "Back-window","Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
+    "right-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window","Back-window", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
 }
 
 DAMAGE_ALLOWED_ON_PART: Dict[str, List[str]] = {
-    "Front-wheel": ["flat_tire"], "Back-wheel": ["flat_tire"],
-    "Windshield": ["glass_break"], "Back-windshield": ["glass_break"],
-    "Headlight": ["broken_light"], "Tail-light": ["broken_light"],
+    "Front-wheel": ["flat_tire"], 
+    "Back-wheel": ["flat_tire"],
+    "Windshield": ["glass_break"], 
+    "Back-windshield": ["glass_break"],
+    "Headlight": ["broken_light"], 
+    "Tail-light": ["broken_light"],
     "Mirror": ["crack", "scratch"],
-    "Front-bumper": ["dent", "scratch", "crack"], "Back-bumper": ["dent", "scratch", "crack"],
-    "Hood": ["dent", "scratch", "crack"], "Trunk": ["dent", "scratch", "crack"],
-    "Fender": ["dent", "scratch", "crack"], "Front-door": ["dent", "scratch", "crack"],
-    "Back-door": ["dent", "scratch", "crack"], "Quarter-panel": ["dent", "scratch", "crack"],
+    "Front-bumper": ["dent", "scratch", "crack"], 
+    "Back-bumper": ["dent", "scratch", "crack"],
+    "Hood": ["dent", "scratch", "crack"], 
+    "Trunk": ["dent", "scratch", "crack"],
+    "Fender": ["dent", "scratch", "crack"], 
+    "Front-door": ["dent", "scratch", "crack"],
+    "Back-door": ["dent", "scratch", "crack"], 
+    "Quarter-panel": ["dent", "scratch", "crack"],
     "Rocker-panel": ["dent", "scratch", "crack"],
+    "Front-window": ["glass_break"],
+    "Back-window": ["glass_break"],
 }
 
 SEVERITY_BANDS: List[Tuple[float, str]] = [(0.05, "Minor"), (0.20, "Moderate"), (1.01, "Severe")]
@@ -687,10 +696,12 @@ class DamagePipeline:
                         }
 
                         if self.cfg.draw:
-                            # Create a fresh copy of the frame to draw target part + damage
+                            # Create a fresh copy of the frame to draw all parts + damage
                             part_vis = frame.copy()
-                            # 1. Draw target car part segmentation mask (orange/amber)
-                            self._draw_part(part_vis, target)
+                            # 1. Draw ALL detected car parts in this frame (orange/amber)
+                            for p in detected_parts:
+                                self._draw_part(part_vis, p)
+                            
                             # 2. Draw damage segmentation mask on top (red)
                             self._draw_damage(part_vis, target.name, dmg.dtype, dmg.conf,
                                               hit["damage_polygon"], (fx1, fy1, fx2, fy2))
