@@ -47,9 +47,9 @@ BASE_DIR = Path(__file__).resolve().parent
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Model paths ───────────────────────────────────────────────────────────────
-MODEL_ANGLE_PATH  = BASE_DIR / "models" / "best_car_angle.pt"
-MODEL_PARTS_PATH  = BASE_DIR / "models" / "best_car_part.pt"
-MODEL_DAMAGE_PATH = BASE_DIR / "models" / "best_damage_type.pt"
+MODEL_ANGLE_PATH  = BASE_DIR / "models" / "car_angle.pt"
+MODEL_PARTS_PATH  = BASE_DIR / "models" / "car_part.pt"
+MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type_bbox_9classes.pt"
 
 # ── Perspective map (camera-view → car-centric) ───────────────────────────────
 # The camera captures a mirror-image of the car's true side.
@@ -67,70 +67,34 @@ PERSPECTIVE_MAP: Dict[str, str] = {
 
 # ── Context-aware part list per car-centric direction ─────────────────────────
 CAR_PARTS_MAP: Dict[str, List[str]] = {
-    "front": [
-        "Front-bumper", "Headlight", "Hood",
-        "License-plate", "Windshield",
-    ],
-    "back": [
-        "Back-bumper", "Trunk", "Tail-light", "Back-windshield",
-    ],
-    "left-side": [
-        "Front-door", "Back-door", "Front-wheel", "Back-wheel",
-        "Fender", "Quarter-panel", "Mirror", "Rocker-panel",
-    ],
-    "right-side": [
-        "Front-door", "Back-door", "Front-wheel", "Back-wheel",
-        "Fender", "Quarter-panel", "Mirror", "Rocker-panel",
-    ],
-    "front-left-side": [
-        "Front-bumper", "Fender", "Mirror",
-        "Hood", "Headlight", "Windshield",
-    ],
-    "front-right-side": [
-        "Front-bumper", "Fender", "Mirror",
-        "Hood", "Headlight", "Windshield",
-    ],
-    "back-left-side": [
-        "Back-bumper", "Quarter-panel",
-        "Tail-light", "Back-windshield",
-    ],
-    "back-right-side": [
-        "Back-bumper", "Quarter-panel",
-        "Tail-light", "Back-windshield",
-    ],
+    "front": ["Front-bumper", "Headlight", "Hood", "Windshield"],
+    "front-left-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield"],
+    "front-right-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield"],
+    "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield"],
+    "back-left-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
+    "back-right-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
+    "left-side": ["Front-door", "Back-door", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
+    "right-side": ["Front-door", "Back-door", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
 }
 
 # ── Which damage types are physically possible on each part ───────────────────
 # Covers every part that appears in CAR_PARTS_MAP plus glass/roof variants
 # that the segmentation model may detect outside of strict context filtering.
 PART_DAMAGE_MAP: Dict[str, List[str]] = {
-    # Wheels
-    "Back-wheel":      ["flat_tire"],
-    "Front-wheel":     ["flat_tire"],
-    # Glass surfaces
-    "Back-window":     ["glass_break"],
-    "Back-windshield": ["glass_break"],
-    "Front-window":    ["glass_break"],
-    "Windshield":      ["glass_break"],
-    # Lights
-    "Headlight":       ["broken_light"],
-    "Tail-light":      ["broken_light"],
-    # Small exterior parts
-    "Mirror":          ["crack", "scratch"],
-    "Grille":          ["crack"],
-    "License-plate":   ["dent", "scratch"],
-    # Bumpers
-    "Front-bumper":    ["dent", "scratch", "crack"],
-    "Back-bumper":     ["dent", "scratch", "crack"],
-    # Body panels
-    "Hood":            ["dent", "scratch", "crack"],
-    "Trunk":           ["dent", "scratch", "crack"],
-    "Roof":            ["dent", "scratch", "crack"],
-    "Fender":          ["dent", "scratch", "crack"],
-    "Front-door":      ["dent", "scratch", "crack"],
-    "Back-door":       ["dent", "scratch", "crack"],
-    "Quarter-panel":   ["dent", "scratch", "crack"],
-    "Rocker-panel":    ["dent", "scratch", "crack"],
+    "Windshield": ["glass shatter", "crack"],
+    "Back-windshield": ["glass shatter", "crack"],
+    "Headlight": ["lamp broken", "dislocated part", "crack"],
+    "Tail-light": ["lamp broken", "dislocated part", "crack"],
+    "Mirror": ["crack", "scratch", "rub", "dislocated part"],
+    "Front-bumper": ["dent", "scratch", "crack", "crash", "rub", "dislocated part", "no part"],
+    "Back-bumper": ["dent", "scratch", "crack", "crash", "rub", "dislocated part", "no part"],
+    "Hood": ["dent", "scratch", "crack", "crash", "rub", "dislocated part"],
+    "Trunk": ["dent", "scratch", "crack", "crash", "rub", "dislocated part"],
+    "Fender": ["dent", "scratch", "crack", "crash", "rub", "dislocated part", "no part"],
+    "Front-door": ["dent", "scratch", "crack", "crash", "rub", "dislocated part"],
+    "Back-door": ["dent", "scratch", "crack", "crash", "rub", "dislocated part"],
+    "Quarter-panel": ["dent", "scratch", "crack", "crash", "rub"],
+    "Rocker-panel": ["dent", "scratch", "crack", "crash", "rub"],
 }
 
 # ── DamageRegistry voting parameters ─────────────────────────────────────────

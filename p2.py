@@ -35,9 +35,9 @@ log = logging.getLogger("damage_pipeline")
 BASE_DIR = Path(__file__).resolve().parent
 
 # ── Model weights — edit these paths for your environment ───────────────────
-MODEL_ANGLE_PATH  = BASE_DIR / "models" / "best_car_angle.pt"
-MODEL_PARTS_PATH  = BASE_DIR / "models" / "best_car_part.pt"
-MODEL_DAMAGE_PATH = BASE_DIR / "models" / "best_damage_type.pt"
+MODEL_ANGLE_PATH  = BASE_DIR / "models" / "car_angle.pt"
+MODEL_PARTS_PATH  = BASE_DIR / "models" / "car_part.pt"
+MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type_seg_6classes.pt"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
