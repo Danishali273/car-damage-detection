@@ -35,9 +35,13 @@ log = logging.getLogger("damage_pipeline")
 BASE_DIR = Path(__file__).resolve().parent
 
 # ── Model weights — edit these paths for your environment ───────────────────
-MODEL_ANGLE_PATH  = BASE_DIR / "models" / "car_angle.pt"
-MODEL_PARTS_PATH  = BASE_DIR / "models" / "car_part.pt"
-MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type_seg_6classes.pt"
+MODEL_CAR_DETECT_PATH = BASE_DIR / "models" / "yolo11n.pt" # model to check that frame had a car or not
+MODEL_ANGLE_PATH  = BASE_DIR / "models" / "car_angle.pt" # model to check the angle of the car 
+MODEL_PARTS_PATH  = BASE_DIR / "models" / "car_part.pt" # model to check the parts of the car
+MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type_bbox_9classes.pt" # model to check the damage of the car
+
+# COCO class IDs that count as "car" for the car-presence gate.
+CAR_COCO_CLASS_IDS = {2, 5, 7}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -46,12 +50,14 @@ MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type_seg_6classes.pt"
 
 @dataclass
 class PipelineConfig:
+    car_detect_model_path: str = str(MODEL_CAR_DETECT_PATH)
     angle_model_path: str = str(MODEL_ANGLE_PATH)
     parts_model_path: str = str(MODEL_PARTS_PATH)
     damage_model_path: str = str(MODEL_DAMAGE_PATH)
 
     parts_conf: float = 0.60
     damage_conf: float = 0.60
+    car_conf: float = 0.40
 
     # How crops are built before being handed to the damage model.
     #   "bbox"   -> raw axis-aligned crop (original behaviour)
@@ -187,6 +193,20 @@ class DamageBox:
 # ═══════════════════════════════════════════════════════════════════════════
 # MODEL WRAPPERS — one thin class per stage, nothing more than "run + parse"
 # ═══════════════════════════════════════════════════════════════════════════
+
+class CarDetectorStage:
+    def __init__(self, weights: str, conf: float = 0.40):
+        self.model = YOLO(weights)
+        self.conf = conf
+        self.target_classes = CAR_COCO_CLASS_IDS
+
+    def has_car(self, frame: np.ndarray) -> bool:
+        results = self.model.predict(frame, conf=self.conf, verbose=False)[0]
+        for box in results.boxes:
+            if int(box.cls[0]) in self.target_classes:
+                return True
+        return False
+
 
 class AngleStage:
     def __init__(self, weights: str):
@@ -367,6 +387,7 @@ class DamagePipeline:
     def __init__(self, cfg: PipelineConfig):
         log.info("Loading angle / parts / damage models …")
         self.cfg = cfg
+        self.car_detector = CarDetectorStage(cfg.car_detect_model_path, conf=cfg.car_conf)
         self.angle = AngleStage(cfg.angle_model_path)
         self.parts = PartsStage(cfg.parts_model_path)
         self.damage = DamageStage(cfg.damage_model_path)
@@ -395,6 +416,7 @@ class DamagePipeline:
 
         frame_idx = 0
         scanned = 0
+        no_car_count = 0
 
         pbar = tqdm(
             total=total_frames if total_frames > 0 else None,
@@ -410,6 +432,12 @@ class DamagePipeline:
                 break
             frame_idx += 1
             if frame_idx % self.cfg.sample_every_n != 0:
+                pbar.update(1)
+                continue
+
+            # Car presence gate
+            if not self.car_detector.has_car(frame):
+                no_car_count += 1
                 pbar.update(1)
                 continue
 
@@ -430,6 +458,7 @@ class DamagePipeline:
 
         pbar.close()
         cap.release()
+        log.info(f"[Pass 1] Scan complete. frames_seen={frame_idx}, car_detected={frame_idx - no_car_count}, no_car={no_car_count}")
 
         # Filter + select top N frames per confirmed direction
         min_frames = self.cfg.min_direction_frames
@@ -949,6 +978,7 @@ def main() -> None:
                      help="Path for JSON report (default: <out-dir>/damage_report.json)")
     ap.add_argument("--parts-conf", type=float, default=0.60)
     ap.add_argument("--damage-conf", type=float, default=0.60)
+    ap.add_argument("--car-conf", type=float, default=0.40)
     ap.add_argument("--crop-strategy", choices=["bbox", "matte"], default="bbox")
     ap.add_argument("--sample-every", type=int, default=1,
                      help="Sample every Nth frame during angle scan (default: 1)")
@@ -968,6 +998,7 @@ def main() -> None:
         damage_model_path=args.damage_weights,
         parts_conf=args.parts_conf,
         damage_conf=args.damage_conf,
+        car_conf=args.car_conf,
         crop_strategy=args.crop_strategy,
         sample_every_n=args.sample_every,
         min_direction_frames=args.min_direction_frames,

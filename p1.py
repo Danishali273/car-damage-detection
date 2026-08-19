@@ -1,13 +1,15 @@
 """
 pipeline.py — Production-Grade Car Damage Detection Pipeline
 =============================================================
-Integrates three models in a single, modular pipeline:
+Integrates four models in a single, modular pipeline:
+  0. Car Detector          (yolo11n.pt)           — YOLO11 detect (gate)
   1. Direction Classifier  (best_car_angle.pt)   — YOLOv8 classify
   2. Parts Segmenter       (best_car_part.pt)    — YOLOv8 seg
   3. Damage Detector       (best_damage_type.pt) — YOLOv8 detect
 
 Key architectural features
 --------------------------
+  • Car Presence Gate — only frames containing a car proceed to analysis
   • Coordinate Transformation  — camera-view → car-centric labels
   • Context-Aware Part Filtering — only relevant parts per view are processed
   • Temporal Aggregation (DamageRegistry) — tracks damage per Track-ID across frames
@@ -47,9 +49,14 @@ BASE_DIR = Path(__file__).resolve().parent
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Model paths ───────────────────────────────────────────────────────────────
-MODEL_ANGLE_PATH  = BASE_DIR / "models" / "car_angle.pt"
-MODEL_PARTS_PATH  = BASE_DIR / "models" / "car_part.pt"
-MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type_bbox_9classes.pt"
+MODEL_CAR_DETECT_PATH = BASE_DIR / "models" / "yolo11n.pt" # model to check that frame had a car or not
+MODEL_ANGLE_PATH      = BASE_DIR / "models" / "car_angle.pt" # model to check the angle of the car 
+MODEL_PARTS_PATH      = BASE_DIR / "models" / "car_part.pt" # model to check the parts of the car
+MODEL_DAMAGE_PATH     = BASE_DIR / "models" / "damage_type_seg_6classes.pt" # model to check the damage of the car
+
+# COCO class IDs that count as "car" for the car-presence gate.
+# 2 = car, 5 = bus, 7 = truck — covers all common vehicle types.
+CAR_COCO_CLASS_IDS = {2, 5, 7}
 
 # ── Perspective map (camera-view → car-centric) ───────────────────────────────
 # The camera captures a mirror-image of the car's true side.
@@ -785,6 +792,39 @@ class DamageRegistry:
 # 8.  MODEL WRAPPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+class CarDetector:
+    """Wraps a YOLO detection model (e.g. yolo11n.pt) for car-presence gating.
+
+    Only frames that contain at least one vehicle (car / bus / truck) are
+    passed downstream — everything else is skipped immediately, saving
+    compute on direction classification, part segmentation, and damage
+    detection.
+    """
+
+    def __init__(
+        self,
+        model_path: str | Path = MODEL_CAR_DETECT_PATH,
+        conf: float = 0.40,
+        target_classes: set | None = None,
+    ) -> None:
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Car detection model not found: {model_path}")
+        self.model = YOLO(str(model_path))
+        self.conf = conf
+        self._target_classes = target_classes or CAR_COCO_CLASS_IDS
+
+    def has_car(self, frame: np.ndarray) -> bool:
+        """Return True if at least one vehicle is detected in the frame."""
+        results = self.model.predict(frame, conf=self.conf, verbose=False)
+        boxes = results[0].boxes
+        for box in boxes:
+            cls_id = int(box.cls[0])
+            if cls_id in self._target_classes:
+                return True
+        return False
+
+
 class DirectionClassifier:
     """Wraps the YOLOv8 classification model for camera-angle prediction."""
 
@@ -1029,11 +1069,14 @@ class DamageDetector:
 
 class CarDamagePipeline:
     """
-    Orchestrates the full three-model pipeline for video inference.
+    Orchestrates the full four-model pipeline for video inference.
 
     Frame-level flow (process_frame)
     ---------------------------------
     ┌─────────────────────────────────────────────────────────────────────┐
+    │ 0) CarDetector.has_car(frame)                                       │
+    │    → skip frame immediately if no vehicle is present                │
+    │                                                                     │
     │ a) DirectionClassifier.predict(frame)                               │
     │    → raw camera label + confidence                                  │
     │                                                                     │
@@ -1059,6 +1102,7 @@ class CarDamagePipeline:
         self,
         parts_conf_floor:  float = 0.30,
         damage_conf_floor: float = 0.30,
+        car_det_conf:      float = 0.40,
         fps:               float = 25.0,
     ) -> None:
         """
@@ -1066,12 +1110,14 @@ class CarDamagePipeline:
         ----------
         parts_conf_floor  : Minimum model confidence to accept a part detection.
         damage_conf_floor : Minimum model confidence to accept a damage detection.
+        car_det_conf      : Minimum confidence for the car-presence gate detector.
         fps               : Effective frames-per-second of the processed stream
                             (src_fps / frame_skip).  All temporal thresholds
                             (min_votes, direction_streak) are computed from this
                             value via compute_adaptive_thresholds().
         """
         log.info("Loading models …")
+        self.car_detector   = CarDetector(MODEL_CAR_DETECT_PATH, conf=car_det_conf)
         self.direction_clf  = DirectionClassifier(MODEL_ANGLE_PATH)
         self.parts_seg      = PartsSegmenter(MODEL_PARTS_PATH)
         self.damage_det     = DamageDetector(MODEL_DAMAGE_PATH)
@@ -1119,6 +1165,11 @@ class CarDamagePipeline:
         parts_frame  = frame.copy()
         damage_frame = frame.copy()
         overlay_p    = parts_frame.copy()
+
+        # ── Step 0: Car presence gate ─────────────────────────────────────────
+        # Skip the entire pipeline if no car/vehicle is detected in the frame.
+        if not self.car_detector.has_car(frame):
+            return parts_frame, damage_frame, None
 
         # ── Step a: Direction classification ─────────────────────────────────
         raw_label, car_direction, dir_conf = self.direction_clf.predict(frame)
@@ -1439,7 +1490,7 @@ def run_video(
         raise ValueError(f"frame_skip must be >= 1, got {frame_skip}")
 
     log.info("=" * 65)
-    log.info("Car Damage Detection — Integrated 3-Model Pipeline")
+    log.info("Car Damage Detection — Integrated 4-Model Pipeline")
     log.info("Input  : %s", video_path)
     log.info("Output : %s", output_path)
     log.info("=" * 65)
@@ -1492,7 +1543,7 @@ def run_video(
             log.warning("VideoWriter for damage could not be opened — damage video will be skipped.")
             writer_damage = None
 
-    frame_idx = written = error_count = 0
+    frame_idx = written = error_count = no_car_count = 0
     max_frame_errors = 10
     t0 = time.time()
 
@@ -1528,6 +1579,9 @@ def run_video(
             _draw_hud(parts_frm,  frame_idx, total_frames, live_fps, stable_dir, "PARTS")
             _draw_hud(damage_frm, frame_idx, total_frames, live_fps, stable_dir, "DAMAGE")
 
+            if stable_dir is None:
+                no_car_count += 1
+
             if writer_parts  is not None:
                 writer_parts.write(parts_frm)
             if writer_damage is not None:
@@ -1549,7 +1603,8 @@ def run_video(
         if preview: cv2.destroyAllWindows()
 
     # ── Damage Report ─────────────────────────────────────────────────────────
-    log.info("Processed %d frames in %.1fs", written, time.time() - t0)
+    log.info("Processed %d frames in %.1fs  (car detected: %d, no car: %d)",
+             written, time.time() - t0, written - no_car_count, no_car_count)
     if written == 0:
         if error_count > 0:
             raise RuntimeError(
@@ -1604,7 +1659,7 @@ def run_image(
     validate_runtime_options(parts_conf, damage_conf)
 
     log.info("=" * 65)
-    log.info("Car Damage Detection — Image Mode")
+    log.info("Car Damage Detection — Image Mode (4-Model Pipeline)")
     log.info("Input  : %s", image_path)
     log.info("Output : %s", output_path)
     log.info("=" * 65)
@@ -1677,7 +1732,7 @@ def run_image(
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Integrated 3-Model Car Damage Pipeline (video & image)",
+        description="Integrated 4-Model Car Damage Pipeline (video & image)",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Examples — Video:
@@ -1702,6 +1757,8 @@ Examples — Image:
                     help="Parts segmentation conf floor (default: 0.50)")
     ap.add_argument("--damage-conf", type=float, default=0.50,
                     help="Damage detection conf floor (default: 0.50)")
+    ap.add_argument("--car-conf",    type=float, default=0.40,
+                    help="Car detection gate conf floor (default: 0.40)")
     # ── Video-only flags ───────────────────────────────────────────────────────
     ap.add_argument("--frame-skip",  type=int, default=1,
                     help="[Video only] Process every Nth frame (default: 1)")
