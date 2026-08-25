@@ -52,7 +52,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_CAR_DETECT_PATH = BASE_DIR / "models" / "yolo11n.pt" # model to check that frame had a car or not
 MODEL_ANGLE_PATH      = BASE_DIR / "models" / "car_angle.pt" # model to check the angle of the car 
 MODEL_PARTS_PATH      = BASE_DIR / "models" / "car_part.pt" # model to check the parts of the car
-MODEL_DAMAGE_PATH     = BASE_DIR / "models" / "damage_type_seg_6classes.pt" # model to check the damage of the car
+MODEL_DAMAGE_PATH     = BASE_DIR / "models" / "damage_type2_seg_6classes.pt" # model to check the damage of the car
 
 # COCO class IDs that count as "car" for the car-presence gate.
 # 2 = car, 5 = bus, 7 = truck — covers all common vehicle types.
@@ -74,14 +74,14 @@ PERSPECTIVE_MAP: Dict[str, str] = {
 
 # ── Context-aware part list per car-centric direction ─────────────────────────
 CAR_PARTS_MAP: Dict[str, List[str]] = {
-    "front": ["Front-bumper", "Headlight", "Hood", "Windshield"],
-    "front-left-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield"],
-    "front-right-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield"],
-    "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield"],
-    "back-left-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
-    "back-right-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
-    "left-side": ["Front-door", "Back-door", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
-    "right-side": ["Front-door", "Back-door", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
+    "front": ["Front-bumper", "Headlight", "Hood", "Windshield", "roof"],
+    "front-left-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield", "roof"],
+    "front-right-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield", "roof"],
+    "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield", "roof"],
+    "back-left-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield", "roof"],
+    "back-right-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield", "roof"],
+    "left-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window", "Back-window","Fender", "Quarter-panel", "Mirror", "Rocker-panel", "roof"],
+    "right-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window","Back-window", "Fender", "Quarter-panel", "Mirror", "Rocker-panel", "roof"],
 }
 
 # ── Which damage types are physically possible on each part ───────────────────

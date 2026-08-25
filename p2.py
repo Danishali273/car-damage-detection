@@ -38,7 +38,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_CAR_DETECT_PATH = BASE_DIR / "models" / "yolo11n.pt" # model to check that frame had a car or not
 MODEL_ANGLE_PATH  = BASE_DIR / "models" / "car_angle.pt" # model to check the angle of the car 
 MODEL_PARTS_PATH  = BASE_DIR / "models" / "car_part.pt" # model to check the parts of the car
-MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type_bbox_9classes.pt" # model to check the damage of the car
+MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type2_seg_6classes.pt" # model to check the damage of the car
 
 # COCO class IDs that count as "car" for the car-presence gate.
 CAR_COCO_CLASS_IDS = {2, 5, 7}
@@ -103,14 +103,14 @@ CAMERA_TO_CAR_DIRECTION: Dict[str, str] = {
 }
 
 PARTS_VISIBLE_FROM: Dict[str, List[str]] = {
-    "front": ["Front-bumper", "Headlight", "Hood", "Windshield"],
-    "front-left-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield"],
-    "front-right-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield"],
-    "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield"],
-    "back-left-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
-    "back-right-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
-    "left-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window", "Back-window","Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
-    "right-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window","Back-window", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
+    "front": ["Front-bumper", "Headlight", "Hood", "Windshield", "roof"],
+    "front-left-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield", "roof"],
+    "front-right-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield", "roof"],
+    "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield", "roof"],
+    "back-left-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield", "roof"],
+    "back-right-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield", "roof"],
+    "left-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window", "Back-window","Fender", "Quarter-panel", "Mirror", "Rocker-panel", "roof"],
+    "right-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window","Back-window", "Fender", "Quarter-panel", "Mirror", "Rocker-panel", "roof"],
 }
 
 DAMAGE_ALLOWED_ON_PART: Dict[str, List[str]] = {
@@ -749,7 +749,7 @@ class DamagePipeline:
         return report
 
     @staticmethod
-    def _dedup_direction_hits(hits: List[Dict], centroid_threshold: float = 0.25) -> List[Dict]:
+    def _dedup_direction_hits(hits: List[Dict], centroid_threshold: float = 0.35) -> List[Dict]:
         """Deduplicate (part, damage_type) pairs from multiple frames of
         the same direction using relative centroid distance.
 
@@ -984,7 +984,7 @@ def main() -> None:
                      help="Sample every Nth frame during angle scan (default: 1)")
     ap.add_argument("--min-direction-frames", type=int, default=1,
                      help="Minimum frames that must agree on a direction to confirm it (default: 1)")
-    ap.add_argument("--frames-per-direction", type=int, default=7,
+    ap.add_argument("--frames-per-direction", type=int, default=8,
                      help="Number of frames to analyze per direction (default: 5)")
     ap.add_argument("--no-draw", action="store_true")
     ap.add_argument("--no-save-keyframes", action="store_true")

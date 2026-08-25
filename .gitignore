@@ -21,3 +21,6 @@
 
 __pycache__
 venv
+
+*.pt
+*.pth

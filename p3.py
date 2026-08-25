@@ -1,13 +1,15 @@
 """
-damage_pipeline.py — Two-Pass Keyframe Car Damage Detection
-===================================================================
-Instead of processing every frame with all three models and voting,
-this pipeline uses a fast two-pass strategy:
+damage_pipeline_rfdetr.py — Two-Pass Keyframe Car Damage Detection (RF-DETR)
+============================================================================
+Same two-pass keyframe strategy as p2.py, but uses an RF-DETR segmentation
+model (rf-detr_damagetype_seg_6classes.pth) for damage detection instead of
+the YOLO-based damage model.  All other stages (car detection, angle
+classification, parts segmentation) remain identical.
 
     Pass 1 (fast):   Scan video with the angle classifier only.
                      Pick the top N best frames per direction (up to 8 directions).
 
-    Pass 2 (targeted): Run parts segmentation + damage detection on
+    Pass 2 (targeted): Run parts segmentation + RF-DETR damage detection on
                        only those keyframes.
 
 Result: ~10-50× faster than frame-by-frame, with cleaner results
@@ -26,7 +28,10 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import torch
+from PIL import Image
 from tqdm import tqdm
+from rfdetr import RFDETRSegMedium
 from ultralytics import YOLO
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -38,7 +43,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_CAR_DETECT_PATH = BASE_DIR / "models" / "yolo11n.pt" # model to check that frame had a car or not
 MODEL_ANGLE_PATH  = BASE_DIR / "models" / "car_angle.pt" # model to check the angle of the car 
 MODEL_PARTS_PATH  = BASE_DIR / "models" / "car_part.pt" # model to check the parts of the car
-MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type_bbox_9classes.pt" # model to check the damage of the car
+MODEL_DAMAGE_PATH = BASE_DIR / "models" / "rf-detr_damagetype_seg_6classes.pth" # RF-DETR model for damage detection & segmentation
 
 # COCO class IDs that count as "car" for the car-presence gate.
 CAR_COCO_CLASS_IDS = {2, 5, 7}
@@ -103,31 +108,35 @@ CAMERA_TO_CAR_DIRECTION: Dict[str, str] = {
 }
 
 PARTS_VISIBLE_FROM: Dict[str, List[str]] = {
-    "front": ["Front-bumper", "Headlight", "Hood", "Windshield"],
-    "front-left-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield"],
-    "front-right-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield"],
-    "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield"],
-    "back-left-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
-    "back-right-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield"],
-    "left-side": ["Front-door", "Back-door", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
-    "right-side": ["Front-door", "Back-door", "Fender", "Quarter-panel", "Mirror", "Rocker-panel"],
+    "front": ["Front-bumper", "Headlight", "Hood", "Windshield", "roof"],
+    "front-left-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield", "roof"],
+    "front-right-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield", "roof"],
+    "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield", "roof"],
+    "back-left-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield", "roof"],
+    "back-right-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield", "roof"],
+    "left-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window", "Back-window","Fender", "Quarter-panel", "Mirror", "Rocker-panel", "roof"],
+    "right-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window","Back-window", "Fender", "Quarter-panel", "Mirror", "Rocker-panel", "roof"],
 }
 
 DAMAGE_ALLOWED_ON_PART: Dict[str, List[str]] = {
-    "Windshield": ["glass shatter", "crack"],
-    "Back-windshield": ["glass shatter", "crack"],
-    "Headlight": ["lamp broken", "dislocated part", "crack"],
-    "Tail-light": ["lamp broken", "dislocated part", "crack"],
-    "Mirror": ["crack", "scratch", "rub", "dislocated part"],
-    "Front-bumper": ["dent", "scratch", "crack", "crash", "rub", "dislocated part", "no part"],
-    "Back-bumper": ["dent", "scratch", "crack", "crash", "rub", "dislocated part", "no part"],
-    "Hood": ["dent", "scratch", "crack", "crash", "rub", "dislocated part"],
-    "Trunk": ["dent", "scratch", "crack", "crash", "rub", "dislocated part"],
-    "Fender": ["dent", "scratch", "crack", "crash", "rub", "dislocated part", "no part"],
-    "Front-door": ["dent", "scratch", "crack", "crash", "rub", "dislocated part"],
-    "Back-door": ["dent", "scratch", "crack", "crash", "rub", "dislocated part"],
-    "Quarter-panel": ["dent", "scratch", "crack", "crash", "rub"],
-    "Rocker-panel": ["dent", "scratch", "crack", "crash", "rub"],
+    "Front-wheel": ["flat_tire"], 
+    "Back-wheel": ["flat_tire"],
+    "Windshield": ["glass_break"], 
+    "Back-windshield": ["glass_break"],
+    "Headlight": ["broken_light"], 
+    "Tail-light": ["broken_light"],
+    "Mirror": ["crack", "scratch"],
+    "Front-bumper": ["dent", "scratch", "crack"], 
+    "Back-bumper": ["dent", "scratch", "crack"],
+    "Hood": ["dent", "scratch", "crack"], 
+    "Trunk": ["dent", "scratch", "crack"],
+    "Fender": ["dent", "scratch", "crack"], 
+    "Front-door": ["dent", "scratch", "crack"],
+    "Back-door": ["dent", "scratch", "crack"], 
+    "Quarter-panel": ["dent", "scratch", "crack"],
+    "Rocker-panel": ["dent", "scratch", "crack"],
+    "Front-window": ["glass_break"],
+    "Back-window": ["glass_break"],
 }
 
 SEVERITY_BANDS: List[Tuple[float, str]] = [(0.05, "Minor"), (0.20, "Moderate"), (1.01, "Severe")]
@@ -242,24 +251,72 @@ class PartsStage:
 
 
 class DamageStage:
-    def __init__(self, weights: str):
-        self.model = YOLO(weights)
+    """RF-DETR based damage detection & segmentation stage.
 
-    def infer(self, crop: np.ndarray, allowed: List[str], conf: float) -> List[DamageBox]:
-        if crop.size == 0 or not allowed:
+    Uses RFDETRSegMedium instead of YOLO.  Accepts BGR numpy crops,
+    converts to PIL RGB for inference, then maps supervision.Detections
+    back to DamageBox objects that the rest of the pipeline expects.
+    """
+
+    # ── Class-index → damage-type name mapping ──────────────────────────
+    # Adjust the order below to match your RF-DETR training configuration.
+    CLASS_NAMES: Dict[int, str] = {
+        0: "dent",
+        1: "scratch",
+        2: "crack",
+        3: "glass_break",
+        4: "broken_light",
+        5: "flat_tire",
+    }
+
+    def __init__(self, weights: str):
+        log.info("Loading RF-DETR damage model from %s …", weights)
+        self.model = RFDETRSegMedium(
+            num_classes=6,
+            patch_size=12,
+            num_queries=200,
+            pretrain_weights=weights,
+        )
+        # Optimize for faster GPU inference (FP16)
+        if torch.cuda.is_available():
+            self.model.inference(dtype=torch.float16)
+        else:
+            self.model.inference()
+
+    def infer(self, image: np.ndarray, conf: float, allowed: Optional[List[str]] = None) -> List[DamageBox]:
+        if image.size == 0:
             return []
-        r = self.model.predict(crop, conf=conf, verbose=False)[0]
+
+        # RF-DETR expects a PIL RGB image
+        pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        detections = self.model.predict(pil_img, threshold=conf)
+
         raw: List[DamageBox] = []
-        for i, box in enumerate(r.boxes):
-            dtype = r.names[int(box.cls[0])]
-            if dtype not in allowed:
+        n = len(detections)  # number of detections
+        for i in range(n):
+            class_id = int(detections.class_id[i])
+            dtype = self.CLASS_NAMES.get(class_id, f"class_{class_id}")
+            if allowed is not None and dtype not in allowed:
                 continue
-            xyxy = tuple(map(int, box.xyxy[0]))
+
+            x1, y1, x2, y2 = map(int, detections.xyxy[i])
+            xyxy = (x1, y1, x2, y2)
+
+            # Convert binary mask → polygon (largest contour)
             mask = None
-            if r.masks is not None and i < len(r.masks.xy):
-                mask = r.masks.xy[i].astype(np.int32)
-            raw.append(DamageBox(dtype, float(box.conf[0]), xyxy, mask))
-        return _dedupe_same_type(raw, crop.shape[:2])
+            if detections.mask is not None and i < len(detections.mask):
+                binary = detections.mask[i].astype(np.uint8)
+                contours, _ = cv2.findContours(
+                    binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                if contours:
+                    best = max(contours, key=cv2.contourArea)
+                    if len(best) >= 3:
+                        mask = best.reshape(-1, 2).astype(np.int32)
+
+            raw.append(DamageBox(dtype, float(detections.confidence[i]), xyxy, mask))
+
+        return _dedupe_same_type(raw, image.shape[:2])
 
 
 def _dedupe_same_type(candidates: List[DamageBox], crop_hw: Tuple[int, int]) -> List[DamageBox]:
@@ -628,114 +685,98 @@ class DamagePipeline:
                 allowed_parts = PARTS_VISIBLE_FROM.get(direction, [])
                 detected_parts = self.parts.infer(frame, allowed_parts, self.cfg.parts_conf)
 
-                for part in detected_parts:
-                    crop, (ox, oy) = build_crop(frame, part, self.cfg)
-                    if crop.size == 0:
+                # 1. Run damage detection ONCE on the full frame
+                damages_found = self.damage.infer(frame, conf=self.cfg.damage_conf)
+
+                # 2. Attribute each detected damage to the best matching car part
+                for dmg in damages_found:
+                    target = reattribute(dmg, origin=(0, 0), parts=detected_parts)
+                    if target is None:
                         continue
 
-                    # Union of allowed damage types for all parts overlapping this crop box
-                    crop_x1, crop_y1, crop_x2, crop_y2 = part.xyxy
-                    overlapping_parts = [
-                        p for p in detected_parts
-                        if max(crop_x1, p.xyxy[0]) < min(crop_x2, p.xyxy[2]) and max(crop_y1, p.xyxy[1]) < min(crop_y2, p.xyxy[3])
-                    ]
-                    allowed_dmg = sorted(list({
-                        dtype
-                        for p in overlapping_parts
-                        for dtype in DAMAGE_ALLOWED_ON_PART.get(p.name, [])
-                    }))
-                    if not allowed_dmg:
-                        allowed_dmg = DAMAGE_ALLOWED_ON_PART.get(part.name, [])
+                    # Damage coordinates are already in full-frame coordinates
+                    fx1, fy1, fx2, fy2 = dmg.xyxy_in_crop
 
-                    for dmg in self.damage.infer(crop, allowed_dmg, self.cfg.damage_conf):
-                        dx1, dy1, dx2, dy2 = dmg.xyxy_in_crop
-                        target = reattribute(dmg, origin=(ox, oy), parts=detected_parts)
-                        if target is None:
-                            continue
+                    damage_poly_str = None
+                    if dmg.mask_in_crop is not None and dmg.mask_in_crop.size >= 6:
+                        poly = dmg.mask_in_crop.copy()
 
-                        # Translate damage bbox back to full-frame coordinates
-                        fx1, fy1, fx2, fy2 = ox + dx1, oy + dy1, ox + dx2, oy + dy2
-
-                        damage_poly_str = None
-                        if dmg.mask_in_crop is not None and dmg.mask_in_crop.size >= 6:
-                            poly = (dmg.mask_in_crop + np.array([ox, oy])).astype(np.int32)
-
-                            # COOKIE-CUTTER: Trim the damage polygon to the target part's polygon
-                            if target.mask_xy is not None and target.mask_xy.size >= 6:
-                                h, w = frame.shape[:2]
-                                dmg_canvas = np.zeros((h, w), dtype=np.uint8)
-                                part_canvas = np.zeros((h, w), dtype=np.uint8)
-                                cv2.fillPoly(dmg_canvas, [poly], 255)
-                                cv2.fillPoly(part_canvas, [target.mask_xy], 255)
-
-                                intersection = cv2.bitwise_and(dmg_canvas, part_canvas)
-                                contours, _ = cv2.findContours(intersection, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-                                if contours:
-                                    best_contour = max(contours, key=cv2.contourArea)
-                                    if len(best_contour) >= 3:
-                                        poly = best_contour.reshape(-1, 2)
-                                        # Update the damage bbox to match the new trimmed mask
-                                        x, y, w_box, h_box = cv2.boundingRect(poly)
-                                        fx1, fy1, fx2, fy2 = x, y, x + w_box, y + h_box
-                                    else:
-                                        continue  # Intersection was just a tiny sliver, ignore this damage
-                                else:
-                                    continue  # Damage is completely outside the part's polygon
-
-                            damage_area = float(cv2.contourArea(poly.astype(np.float32)))
-                            damage_poly_str = " ".join(map(str, poly.reshape(-1).tolist()))
-                        else:
-                            damage_area = float((fx2 - fx1) * (fy2 - fy1))
-
-                        # Compute severity from (possibly trimmed) damage area vs part area
-                        sev_ratio = damage_area / target.area_px if target.area_px > 0 else 0.0
-
-                        part_poly_str = None
+                        # COOKIE-CUTTER: Trim the damage polygon to the target part's polygon
                         if target.mask_xy is not None and target.mask_xy.size >= 6:
-                            part_poly_str = " ".join(map(str, target.mask_xy.reshape(-1).tolist()))
+                            h, w = frame.shape[:2]
+                            dmg_canvas = np.zeros((h, w), dtype=np.uint8)
+                            part_canvas = np.zeros((h, w), dtype=np.uint8)
+                            cv2.fillPoly(dmg_canvas, [poly], 255)
+                            cv2.fillPoly(part_canvas, [target.mask_xy], 255)
 
-                        # Compute relative centroid of damage within the part bbox
-                        px1, py1, px2, py2 = target.xyxy
-                        part_w = max(px2 - px1, 1)
-                        part_h = max(py2 - py1, 1)
-                        dmg_cx = (fx1 + fx2) / 2.0
-                        dmg_cy = (fy1 + fy2) / 2.0
-                        rel_cx = (dmg_cx - px1) / part_w
-                        rel_cy = (dmg_cy - py1) / part_h
+                            intersection = cv2.bitwise_and(dmg_canvas, part_canvas)
+                            contours, _ = cv2.findContours(intersection, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                        hit = {
-                            "part": target.name,
-                            "damage_type": dmg.dtype,
-                            "car_view": direction,
-                            "confidence": round(dmg.conf, 3),
-                            "severity": severity_for(sev_ratio),
-                            "severity_ratio": round(sev_ratio, 4),
-                            "frame_index": kf.frame_idx,
-                            "timestamp_seconds": kf.timestamp_seconds,
-                            "part_bbox": " ".join(map(str, target.xyxy)),
-                            "part_polygon": part_poly_str,
-                            "damage_bbox": " ".join(map(str, [fx1, fy1, fx2, fy2])),
-                            "damage_polygon": damage_poly_str,
-                            "_rel_centroid": (rel_cx, rel_cy)
-                        }
+                            if contours:
+                                best_contour = max(contours, key=cv2.contourArea)
+                                if len(best_contour) >= 3:
+                                    poly = best_contour.reshape(-1, 2)
+                                    # Update the damage bbox to match the new trimmed mask
+                                    x, y, w_box, h_box = cv2.boundingRect(poly)
+                                    fx1, fy1, fx2, fy2 = x, y, x + w_box, y + h_box
+                                else:
+                                    continue  # Intersection was just a tiny sliver, ignore this damage
+                            else:
+                                continue  # Damage is completely outside the part's polygon
 
-                        if self.cfg.draw:
-                            # Create a fresh copy of the frame to draw all parts + damage
-                            part_vis = frame.copy()
-                            # 1. Draw ALL detected car parts in this frame (orange/amber)
-                            for p in detected_parts:
-                                self._draw_part(part_vis, p)
-                            
-                            # 2. Draw damage segmentation mask on top (red)
-                            self._draw_damage(part_vis, target.name, dmg.dtype, dmg.conf,
-                                              hit["damage_polygon"], (fx1, fy1, fx2, fy2))
-                            cv2.putText(part_vis, f"view: {direction}  (frame #{kf.frame_idx})",
-                                        (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-                            hit["vis_image"] = part_vis
+                        damage_area = float(cv2.contourArea(poly.astype(np.float32)))
+                        damage_poly_str = " ".join(map(str, poly.reshape(-1).tolist()))
+                    else:
+                        damage_area = float((fx2 - fx1) * (fy2 - fy1))
 
-                        hit["raw_image"] = frame.copy()
-                        dir_hits.append(hit)
+                    # Compute severity from (possibly trimmed) damage area vs part area
+                    sev_ratio = damage_area / target.area_px if target.area_px > 0 else 0.0
+
+                    part_poly_str = None
+                    if target.mask_xy is not None and target.mask_xy.size >= 6:
+                        part_poly_str = " ".join(map(str, target.mask_xy.reshape(-1).tolist()))
+
+                    # Compute relative centroid of damage within the part bbox
+                    px1, py1, px2, py2 = target.xyxy
+                    part_w = max(px2 - px1, 1)
+                    part_h = max(py2 - py1, 1)
+                    dmg_cx = (fx1 + fx2) / 2.0
+                    dmg_cy = (fy1 + fy2) / 2.0
+                    rel_cx = (dmg_cx - px1) / part_w
+                    rel_cy = (dmg_cy - py1) / part_h
+
+                    hit = {
+                        "part": target.name,
+                        "damage_type": dmg.dtype,
+                        "car_view": direction,
+                        "confidence": round(dmg.conf, 3),
+                        "severity": severity_for(sev_ratio),
+                        "severity_ratio": round(sev_ratio, 4),
+                        "frame_index": kf.frame_idx,
+                        "timestamp_seconds": kf.timestamp_seconds,
+                        "part_bbox": " ".join(map(str, target.xyxy)),
+                        "part_polygon": part_poly_str,
+                        "damage_bbox": " ".join(map(str, [fx1, fy1, fx2, fy2])),
+                        "damage_polygon": damage_poly_str,
+                        "_rel_centroid": (rel_cx, rel_cy)
+                    }
+
+                    if self.cfg.draw:
+                        # Create a fresh copy of the frame to draw all parts + damage
+                        part_vis = frame.copy()
+                        # 1. Draw ALL detected car parts in this frame (orange/amber)
+                        for p in detected_parts:
+                            self._draw_part(part_vis, p)
+                        
+                        # 2. Draw damage segmentation mask on top (red)
+                        self._draw_damage(part_vis, target.name, dmg.dtype, dmg.conf,
+                                          hit["damage_polygon"], (fx1, fy1, fx2, fy2))
+                        cv2.putText(part_vis, f"view: {direction}  (frame #{kf.frame_idx})",
+                                    (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                        hit["vis_image"] = part_vis
+
+                    hit["raw_image"] = frame.copy()
+                    dir_hits.append(hit)
 
             # Deduplicate: same (part, damage_type) → keep highest confidence
             deduped = self._dedup_direction_hits(dir_hits)
@@ -745,14 +786,15 @@ class DamagePipeline:
         return report
 
     @staticmethod
-    def _dedup_direction_hits(hits: List[Dict], centroid_threshold: float = 0.25) -> List[Dict]:
+    def _dedup_direction_hits(hits: List[Dict], centroid_threshold: float = 0.35) -> List[Dict]:
         """Deduplicate (part, damage_type) pairs from multiple frames of
         the same direction using relative centroid distance.
 
         Two hits with the same (part, damage_type) are considered the SAME
         physical damage if their relative centroids are within
         `centroid_threshold` (Euclidean distance in 0-1 normalised space).
-        In that case, only the highest-confidence entry is kept.
+        In that case, the entry with the LARGEST damage coverage is kept
+        (severity_ratio first, confidence as tiebreaker).
 
         If centroids are farther apart, they are treated as two physically
         separate damages and BOTH are kept."""
@@ -765,8 +807,10 @@ class DamagePipeline:
 
         result: List[Dict] = []
         for key, group in groups.items():
-            # Sort by confidence descending
-            group.sort(key=lambda h: h["confidence"], reverse=True)
+            # Sort by damage area coverage (severity_ratio) first, then confidence
+            # This ensures we keep the frame with the MOST COMPLETE damage area,
+            # not just the one with highest confidence but tiny coverage.
+            group.sort(key=lambda h: (h.get("severity_ratio", 0), h["confidence"]), reverse=True)
 
             # Cluster: each accepted hit is a cluster centre
             clusters: List[Dict] = []
@@ -777,7 +821,7 @@ class DamagePipeline:
                     ex, ey = existing.get("_rel_centroid", (0.5, 0.5))
                     dist = ((cx - ex) ** 2 + (cy - ey) ** 2) ** 0.5
                     if dist < centroid_threshold:
-                        # Same physical damage — existing already has higher conf
+                        # Same physical damage — existing already has better coverage
                         merged = True
                         break
                 if not merged:
@@ -972,15 +1016,15 @@ def main() -> None:
                      help="Directory for keyframe images and report (default: output/)")
     ap.add_argument("--out-report", default=None,
                      help="Path for JSON report (default: <out-dir>/damage_report.json)")
-    ap.add_argument("--parts-conf", type=float, default=0.60)
-    ap.add_argument("--damage-conf", type=float, default=0.60)
+    ap.add_argument("--parts-conf", type=float, default=0.30)
+    ap.add_argument("--damage-conf", type=float, default=0.30)
     ap.add_argument("--car-conf", type=float, default=0.40)
     ap.add_argument("--crop-strategy", choices=["bbox", "matte"], default="bbox")
     ap.add_argument("--sample-every", type=int, default=1,
                      help="Sample every Nth frame during angle scan (default: 1)")
     ap.add_argument("--min-direction-frames", type=int, default=1,
                      help="Minimum frames that must agree on a direction to confirm it (default: 1)")
-    ap.add_argument("--frames-per-direction", type=int, default=7,
+    ap.add_argument("--frames-per-direction", type=int, default=1,
                      help="Number of frames to analyze per direction (default: 5)")
     ap.add_argument("--no-draw", action="store_true")
     ap.add_argument("--no-save-keyframes", action="store_true")
