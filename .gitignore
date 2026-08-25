@@ -22,5 +22,4 @@
 __pycache__
 venv
 
-*.pt
-*.pth
+models/
