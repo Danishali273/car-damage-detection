@@ -130,6 +130,7 @@ DAMAGE_ALLOWED_ON_PART: Dict[str, List[str]] = {
     "Back-door": ["dent", "scratch", "crack"], 
     "Quarter-panel": ["dent", "scratch", "crack"],
     "Rocker-panel": ["dent", "scratch", "crack"],
+    "roof": ["dent", "scratch", "crack"],
     "Front-window": ["glass_break"],
     "Back-window": ["glass_break"],
 }
@@ -300,14 +301,6 @@ def build_crop(frame: np.ndarray, part: PartBox, cfg: PipelineConfig) -> Tuple[n
     """Return (crop_image, (origin_x, origin_y)) for damage inference."""
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = part.xyxy
-
-    if cfg.crop_strategy == "matte" and part.mask_xy is not None and part.mask_xy.size >= 6:
-        crop = frame[y1:y2, x1:x2].copy()
-        local_mask = (part.mask_xy - np.array([x1, y1])).astype(np.int32)
-        alpha = np.zeros(crop.shape[:2], np.uint8)
-        cv2.fillPoly(alpha, [local_mask], 255)
-        crop[alpha == 0] = 0
-        return crop, (x1, y1)
 
     # default: plain bbox
     return frame[y1:y2, x1:x2], (x1, y1)
@@ -610,6 +603,7 @@ class DamagePipeline:
         Returns a list of raw damage hits (with 'vis_image' attached if drawing is enabled).
         """
         report: List[Dict] = []
+        self._frame_visuals: Dict[Tuple[str, int], Tuple[np.ndarray, Optional[np.ndarray]]] = {}
         total_frames = sum(len(kfs) for kfs in keyframes.values())
 
         pbar = tqdm(
@@ -631,6 +625,14 @@ class DamagePipeline:
                 frame = kf.frame
                 allowed_parts = PARTS_VISIBLE_FROM.get(direction, [])
                 detected_parts = self.parts.infer(frame, allowed_parts, self.cfg.parts_conf)
+                frame_key = (direction, kf.frame_idx)
+                annotated_frame = frame.copy() if self.cfg.draw else None
+                if annotated_frame is not None:
+                    for detected_part in detected_parts:
+                        self._draw_part(annotated_frame, detected_part)
+                    sharpness = calculate_sharpness(frame)
+                    cv2.putText(annotated_frame, f"view: {direction}  conf: {kf.confidence:.2f}  score: {sharpness:.2f}  (frame #{kf.frame_idx})",
+                                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
 
                 for part in detected_parts:
                     crop, (ox, oy) = build_crop(frame, part, self.cfg)
@@ -724,22 +726,12 @@ class DamagePipeline:
                             "_rel_centroid": (rel_cx, rel_cy)
                         }
 
-                        if self.cfg.draw:
-                            # Create a fresh copy of the frame to draw all parts + damage
-                            part_vis = frame.copy()
-                            # 1. Draw ALL detected car parts in this frame (orange/amber)
-                            for p in detected_parts:
-                                self._draw_part(part_vis, p)
-                            
-                            # 2. Draw damage segmentation mask on top (red)
-                            self._draw_damage(part_vis, target.name, dmg.dtype, dmg.conf,
+                        if annotated_frame is not None:
+                            self._draw_damage(annotated_frame, target.name, dmg.dtype, dmg.conf,
                                               hit["damage_polygon"], (fx1, fy1, fx2, fy2))
-                            cv2.putText(part_vis, f"view: {direction}  (frame #{kf.frame_idx})",
-                                        (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-                            hit["vis_image"] = part_vis
-
-                        hit["raw_image"] = frame.copy()
                         dir_hits.append(hit)
+
+                self._frame_visuals[frame_key] = (frame.copy(), annotated_frame)
 
             # Deduplicate: same (part, damage_type) → keep highest confidence
             deduped = self._dedup_direction_hits(dir_hits)
@@ -773,20 +765,31 @@ class DamagePipeline:
             group.sort(key=lambda h: h["confidence"], reverse=True)
 
             # Cluster: each accepted hit is a cluster centre
-            clusters: List[Dict] = []
+            clusters: List[List[Dict]] = []
             for hit in group:
                 cx, cy = hit.get("_rel_centroid", (0.5, 0.5))
                 merged = False
-                for existing in clusters:
+                for cluster in clusters:
+                    existing = cluster[0]
                     ex, ey = existing.get("_rel_centroid", (0.5, 0.5))
                     dist = ((cx - ex) ** 2 + (cy - ey) ** 2) ** 0.5
                     if dist < centroid_threshold:
-                        # Same physical damage — existing already has higher conf
+                        cluster.append(hit)
                         merged = True
                         break
                 if not merged:
-                    clusters.append(hit)
-            result.extend(clusters)
+                    clusters.append([hit])
+                    
+            for cluster in clusters:
+                # 1. Pick the hit with the highest severity_ratio (most complete mask)
+                best_area_hit = max(cluster, key=lambda h: h.get("severity_ratio", 0.0))
+                # 2. Keep the max confidence seen in this cluster (from the first item due to sort)
+                max_conf = cluster[0]["confidence"]
+                
+                merged_hit = best_area_hit.copy()
+                merged_hit["confidence"] = max_conf
+                merged_hit["_cluster_size"] = len(cluster)
+                result.append(merged_hit)
         return result
 
     @staticmethod
@@ -821,7 +824,7 @@ class DamagePipeline:
                         return True
             return False
 
-        kept: List[Dict] = []
+        clusters: List[List[Dict]] = []
         for hit in sorted(hits, key=lambda h: h["confidence"], reverse=True):
             part = hit["part"]
             dtype = hit["damage_type"]
@@ -829,16 +832,30 @@ class DamagePipeline:
             cx, cy = hit.get("_rel_centroid", (0.5, 0.5))
 
             is_dup = False
-            for k in kept:
+            for cluster in clusters:
+                k = cluster[0]
                 if k["part"] == part and k["damage_type"] == dtype and views_can_share(view, k["car_view"], part):
                     kx, ky = k.get("_rel_centroid", (0.5, 0.5))
                     dist = ((cx - kx) ** 2 + (cy - ky) ** 2) ** 0.5
                     if dist < centroid_threshold:
+                        cluster.append(hit)
                         is_dup = True
                         break
             
             if not is_dup:
-                kept.append(hit)
+                clusters.append([hit])
+                
+        kept: List[Dict] = []
+        for cluster in clusters:
+            # Pick the hit with the maximum damage area/severity
+            best_area_hit = max(cluster, key=lambda h: h.get("severity_ratio", 0.0))
+            # Preserve the maximum confidence
+            max_conf = cluster[0]["confidence"]
+            
+            merged_hit = best_area_hit.copy()
+            merged_hit["confidence"] = max_conf
+            kept.append(merged_hit)
+            
         return kept
 
     # ── Main entry point ─────────────────────────────────────────────────
@@ -865,7 +882,7 @@ class DamagePipeline:
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
 
-        # Save annotated keyframe image per unique damaged part
+        # Save every selected keyframe. Damage annotations are combined per frame.
         if self.cfg.save_keyframes:
             keyframes_dir = out_path / "keyframes"
             orig_dir = keyframes_dir / "original"
@@ -873,39 +890,25 @@ class DamagePipeline:
             orig_dir.mkdir(parents=True, exist_ok=True)
             anno_dir.mkdir(parents=True, exist_ok=True)
             
-            # Sort report by frame index (ascending) so files are numbered
-            # in the order frames appear in the video.
-            report.sort(key=lambda h: h.get("frame_index", 0))
-            
-            used_filenames: Dict[str, int] = {}
-            for seq_num, item in enumerate(report, start=1):
-                safe_part = item["part"].replace(" ", "_")
-                safe_dmg = item["damage_type"].replace(" ", "_")
-                safe_view = item["car_view"].replace(" ", "_")
-                
-                order_prefix = str(seq_num).zfill(3)  # e.g. 001, 002, …
-                base_name = f"{order_prefix}_frame{item.get('frame_index', 0)}_{safe_view}_{safe_part}_{safe_dmg}"
-                
-                # If same base_name already used, add index suffix
-                if base_name in used_filenames:
-                    used_filenames[base_name] += 1
-                    filename = f"{base_name}_{used_filenames[base_name]}.jpg"
-                else:
-                    used_filenames[base_name] = 1
-                    filename = f"{base_name}.jpg"
-                
-                if "raw_image" in item:
-                    cv2.imwrite(str(orig_dir / filename), item["raw_image"])
-                    del item["raw_image"]
-                
-                if "vis_image" in item:
-                    cv2.imwrite(str(anno_dir / filename), item["vis_image"])
-                    del item["vis_image"]
-                
-                # Remove internal centroid field before saving
+            filename_by_frame: Dict[Tuple[str, int], str] = {}
+            all_keyframes = [kf for kfs in keyframes.values() for kf in kfs]
+            all_keyframes.sort(key=lambda kf: (kf.frame_idx, kf.direction))
+            for seq_num, kf in enumerate(all_keyframes, start=1):
+                safe_view = kf.direction.replace(" ", "_")
+                filename = f"{seq_num:03d}_frame{kf.frame_idx}_{safe_view}.jpg"
+                filename_by_frame[(kf.direction, kf.frame_idx)] = filename
+                raw_image, annotated_image = self._frame_visuals[(kf.direction, kf.frame_idx)]
+                cv2.imwrite(str(orig_dir / filename), raw_image)
+                if annotated_image is not None:
+                    cv2.imwrite(str(anno_dir / filename), annotated_image)
+
+            for item in report:
+                frame_key = (item["car_view"], item["frame_index"])
+                filename = filename_by_frame.get(frame_key)
+                if filename:
+                    item["image_filename"] = f"keyframes/original/{filename}"
+                    item["annotated_image_filename"] = f"keyframes/annotated/{filename}"
                 item.pop("_rel_centroid", None)
-                item["image_filename"] = f"keyframes/original/{filename}"
-                item["annotated_image_filename"] = f"keyframes/annotated/{filename}"
 
             log.info("Keyframe images saved -> %s (original & annotated)", keyframes_dir)
 
@@ -984,7 +987,7 @@ def main() -> None:
                      help="Sample every Nth frame during angle scan (default: 1)")
     ap.add_argument("--min-direction-frames", type=int, default=1,
                      help="Minimum frames that must agree on a direction to confirm it (default: 1)")
-    ap.add_argument("--frames-per-direction", type=int, default=8,
+    ap.add_argument("--frames-per-direction", type=int, default=1,
                      help="Number of frames to analyze per direction (default: 5)")
     ap.add_argument("--no-draw", action="store_true")
     ap.add_argument("--no-save-keyframes", action="store_true")

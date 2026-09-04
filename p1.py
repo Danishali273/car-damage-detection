@@ -102,6 +102,7 @@ PART_DAMAGE_MAP: Dict[str, List[str]] = {
     "Back-door": ["dent", "scratch", "crack", "crash", "rub", "dislocated part"],
     "Quarter-panel": ["dent", "scratch", "crack", "crash", "rub"],
     "Rocker-panel": ["dent", "scratch", "crack", "crash", "rub"],
+    "roof": ["dent", "scratch", "crack", "crash", "rub", "dislocated part"],
 }
 
 # ── DamageRegistry voting parameters ─────────────────────────────────────────
@@ -240,7 +241,7 @@ def part_color(part_name: str) -> Tuple[int, int, int]:
 
 def get_allowed_damage(part_name: str) -> List[str]:
     """Return damage types that are physically possible on this part."""
-    return PART_DAMAGE_MAP.get(part_name)
+    return PART_DAMAGE_MAP.get(part_name, [])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1753,9 +1754,9 @@ Examples — Image:
     ap.add_argument("--output",      default="result_pipeline",
                     help="Base output path without extension (default: result_pipeline).\n"
                          "Extensions are added automatically (_parts.mp4 / _parts.jpg etc.).")
-    ap.add_argument("--parts-conf",  type=float, default=0.50,
+    ap.add_argument("--parts-conf",  type=float, default=0.60,
                     help="Parts segmentation conf floor (default: 0.50)")
-    ap.add_argument("--damage-conf", type=float, default=0.50,
+    ap.add_argument("--damage-conf", type=float, default=0.60,
                     help="Damage detection conf floor (default: 0.50)")
     ap.add_argument("--car-conf",    type=float, default=0.40,
                     help="Car detection gate conf floor (default: 0.40)")
