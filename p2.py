@@ -38,7 +38,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_CAR_DETECT_PATH = BASE_DIR / "models" / "yolo11n.pt" # model to check that frame had a car or not
 MODEL_ANGLE_PATH  = BASE_DIR / "models" / "car_angle.pt" # model to check the angle of the car 
 MODEL_PARTS_PATH  = BASE_DIR / "models" / "car_part.pt" # model to check the parts of the car
-MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type2_seg_6classes.pt" # model to check the damage of the car
+MODEL_DAMAGE_PATH = BASE_DIR / "models" / "damage_type_seg_6classes.pt" # model to check the damage of the car
 
 # COCO class IDs that count as "car" for the car-presence gate.
 CAR_COCO_CLASS_IDS = {2, 5, 7}
@@ -103,42 +103,54 @@ CAMERA_TO_CAR_DIRECTION: Dict[str, str] = {
 }
 
 PARTS_VISIBLE_FROM: Dict[str, List[str]] = {
-    "front": ["Front-bumper", "Headlight", "Hood", "Windshield", "roof"],
-    "front-left-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield", "roof"],
-    "front-right-side": ["Front-bumper", "Fender", "Mirror", "Headlight", "Windshield", "roof"],
-    "back": ["Back-bumper", "Trunk", "Tail-light", "Back-windshield", "roof"],
-    "back-left-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield", "roof"],
-    "back-right-side": ["Back-bumper", "Quarter-panel", "Tail-light", "Back-windshield", "roof"],
-    "left-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window", "Back-window","Fender", "Quarter-panel", "Mirror", "Rocker-panel", "roof"],
-    "right-side": ["Front-door", "Back-door", "Front-wheel", "Back-wheel", "Front-window","Back-window", "Fender", "Quarter-panel", "Mirror", "Rocker-panel", "roof"],
-}
+    "front": ["Front_Bumper", "Front_Windshield_Glass", "Hood_Bonnet", "Grill" , "Left_Headlight", "Right_Headlight", "Roof"],
 
+    "front-left-side": ["Front_Bumper", "Left_Front_Door", "Left_Front_Door_Glass", "Left_Running_Board", "Left_Fender", "Left_Side_Mirror", "Left_Headlight", "Front_Windshield_Glass", "Hood_Bonnet","tyre", "Roof"],
+    "front-right-side": ["Front_Bumper", "Right_Front_Door", "Right_Front_Door_Glass", "Right_Running_Board", "Right_Fender", "Right_Side_Mirror", "Right_Headlight", "Front_Windshield_Glass", "Hood_Bonnet", "tyre","Roof"],
+    
+    "back": ["Rear_Bumper", "Diggi_Back_Door", "Diggi_Back_Door_Glass" , "Right_Taillight", "Left_Taillight" , "Roof"],
+
+    "back-left-side": ["Rear_Bumper", "Diggi_Back_Door", "Diggi_Back_Door_Glass" , "Left_Quarter_Panel", "Left_Taillight" ,"tyre", "Roof"],
+    "back-right-side": ["Rear_Bumper", "Diggi_Back_Door", "Diggi_Back_Door_Glass" , "Right_Quarter_Panel" ,"Right_Taillight" ,"tyre", "Roof"],
+
+    "left-side": ["Left_Front_Door", "Left_Front_Door_Glass", "Left_Rear_Door" , "Left_Rear_Door_Glass" , "Left_Fender", "Left_Quarter_Panel" ,"Left_Running_Board","Left_Side_Mirror", "tyre", "Roof"],
+    "right-side": ["Right_Front_Door", "Right_Front_Door_Glass", "Right_Rear_Door" , "Right_Rear_Door_Glass" ,"Right_Fender", "Right_Quarter_Panel" ,"Right_Running_Board","Right_Side_Mirror", "tyre", "Roof"],
+}
 DAMAGE_ALLOWED_ON_PART: Dict[str, List[str]] = {
-    "Front-wheel": ["flat_tire"], 
-    "Back-wheel": ["flat_tire"],
-    "Windshield": ["glass_break"], 
-    "Back-windshield": ["glass_break"],
-    "Headlight": ["broken_light"], 
-    "Tail-light": ["broken_light"],
-    "Mirror": ["crack", "scratch"],
-    "Front-bumper": ["dent", "scratch", "crack"], 
-    "Back-bumper": ["dent", "scratch", "crack"],
-    "Hood": ["dent", "scratch", "crack"], 
-    "Trunk": ["dent", "scratch", "crack"],
-    "Fender": ["dent", "scratch", "crack"], 
-    "Front-door": ["dent", "scratch", "crack"],
-    "Back-door": ["dent", "scratch", "crack"], 
-    "Quarter-panel": ["dent", "scratch", "crack"],
-    "Rocker-panel": ["dent", "scratch", "crack"],
-    "roof": ["dent", "scratch", "crack"],
-    "Front-window": ["glass_break"],
-    "Back-window": ["glass_break"],
+    'Diggi_Back_Door' : ["dent", "scratch", "crack"],
+    'Diggi_Back_Door_Glass': ["glass_break"],
+    'Front_Bumper': ["dent", "scratch", "crack"],
+    'Front_Windshield_Glass': ["glass_break"],
+    'Grill': ["scratch", "crack"],
+    'Hood_Bonnet': ["dent", "scratch", "crack"],
+    'Left_Fender': ["dent", "scratch", "crack"],
+    'Left_Front_Door': ["dent", "scratch", "crack"],
+    'Left_Front_Door_Glass': ["glass_break"],
+    'Left_Headlight': ["broken_light"],
+    'Left_Quarter_Panel': ["dent", "scratch", "crack"],
+    'Left_Rear_Door': ["dent", "scratch", "crack"],
+    'Left_Rear_Door_Glass': ["glass_break"],
+    'Left_Running_Board': ["dent", "scratch", "crack"],
+    'Left_Side_Mirror': ["dent", "scratch", "crack"],
+    'Left_Taillight': ["broken_light"],
+    'Rear_Bumper': ["dent", "scratch", "crack"],
+    'Right_Fender': ["dent", "scratch", "crack"],
+    'Right_Front_Door': ["dent", "scratch", "crack"],
+    'Right_Front_Door_Glass': ["glass_break"],
+    'Right_Headlight': ["broken_light"],
+    'Right_Quarter_Panel': ["dent", "scratch", "crack"],
+    'Right_Rear_Door': ["dent", "scratch", "crack"],
+    'Right_Rear_Door_Glass': ["glass_break"],
+    'Right_Running_Board': ["dent", "scratch", "crack"],
+    'Right_Side_Mirror': ["dent", "scratch", "crack"],
+    'Right_Taillight': ["broken_light"],
+    'Roof': ["dent", "scratch", "crack"],
 }
 
 SEVERITY_BANDS: List[Tuple[float, str]] = [(0.05, "Minor"), (0.20, "Moderate"), (1.01, "Severe")]
 
 # Singular car parts that span across multiple adjacent view angles
-SINGULAR_PARTS: set = {"Front-bumper", "Back-bumper", "Hood", "Trunk", "Windshield", "Back-windshield"}
+SINGULAR_PARTS: set = {"Front_Bumper", "Rear_Bumper", "Hood_Bonnet", "Diggi_Back_Door", "Front_Windshield_Glass", "Diggi_Back_Door_Glass"}
 
 # Adjacent views for cross-view deduplication
 VIEW_ADJACENCY: Dict[str, set] = {
@@ -201,12 +213,18 @@ class CarDetectorStage:
         self.conf = conf
         self.target_classes = CAR_COCO_CLASS_IDS
 
-    def has_car(self, frame: np.ndarray) -> bool:
+    def get_car_bbox(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
         results = self.model.predict(frame, conf=self.conf, verbose=False)[0]
+        best_box = None
+        max_area = -1
         for box in results.boxes:
             if int(box.cls[0]) in self.target_classes:
-                return True
-        return False
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                area = (x2 - x1) * (y2 - y1)
+                if area > max_area:
+                    max_area = area
+                    best_box = (x1, y1, x2, y2)
+        return best_box
 
 
 class AngleStage:
@@ -429,7 +447,8 @@ class DamagePipeline:
                 continue
 
             # Car presence gate
-            if not self.car_detector.has_car(frame):
+            car_bbox = self.car_detector.get_car_bbox(frame)
+            if car_bbox is None:
                 no_car_count += 1
                 pbar.update(1)
                 continue
@@ -440,7 +459,9 @@ class DamagePipeline:
 
             # Quality gate: skip blurry / out-of-focus frames
             if self.cfg.min_sharpness > 0:
-                sharpness = calculate_sharpness(frame)
+                cx1, cy1, cx2, cy2 = car_bbox
+                car_crop = frame[cy1:cy2, cx1:cx2]
+                sharpness = calculate_sharpness(car_crop) if car_crop.size > 0 else 0.0
                 if sharpness < self.cfg.min_sharpness:
                     pbar.update(1)
                     continue
@@ -627,12 +648,20 @@ class DamagePipeline:
                 detected_parts = self.parts.infer(frame, allowed_parts, self.cfg.parts_conf)
                 frame_key = (direction, kf.frame_idx)
                 annotated_frame = frame.copy() if self.cfg.draw else None
+                car_bbox = self.car_detector.get_car_bbox(frame)
+                
                 if annotated_frame is not None:
                     for detected_part in detected_parts:
                         self._draw_part(annotated_frame, detected_part)
-                    sharpness = calculate_sharpness(frame)
+                    sharpness = 0.0
+                    text_x, text_y = 10, 22
+                    if car_bbox:
+                        cx1, cy1, cx2, cy2 = car_bbox
+                        car_crop = frame[cy1:cy2, cx1:cx2]
+                        sharpness = calculate_sharpness(car_crop) if car_crop.size > 0 else 0.0
+                        text_x, text_y = cx1 + 10, cy1 + 22
                     cv2.putText(annotated_frame, f"view: {direction}  conf: {kf.confidence:.2f}  score: {sharpness:.2f}  (frame #{kf.frame_idx})",
-                                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+                                (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
 
                 for part in detected_parts:
                     crop, (ox, oy) = build_crop(frame, part, self.cfg)
@@ -731,7 +760,15 @@ class DamagePipeline:
                                               hit["damage_polygon"], (fx1, fy1, fx2, fy2))
                         dir_hits.append(hit)
 
-                self._frame_visuals[frame_key] = (frame.copy(), annotated_frame)
+                out_frame = frame.copy()
+                out_anno = annotated_frame
+                if car_bbox:
+                    cx1, cy1, cx2, cy2 = car_bbox
+                    out_frame = out_frame[cy1:cy2, cx1:cx2].copy()
+                    if out_anno is not None:
+                        out_anno = out_anno[cy1:cy2, cx1:cx2].copy()
+                        
+                self._frame_visuals[frame_key] = (out_frame, out_anno)
 
             # Deduplicate: same (part, damage_type) → keep highest confidence
             deduped = self._dedup_direction_hits(dir_hits)
@@ -983,7 +1020,7 @@ def main() -> None:
     ap.add_argument("--damage-conf", type=float, default=0.60)
     ap.add_argument("--car-conf", type=float, default=0.40)
     ap.add_argument("--crop-strategy", choices=["bbox", "matte"], default="bbox")
-    ap.add_argument("--sample-every", type=int, default=1,
+    ap.add_argument("--sample-every", type=int, default=2,
                      help="Sample every Nth frame during angle scan (default: 1)")
     ap.add_argument("--min-direction-frames", type=int, default=1,
                      help="Minimum frames that must agree on a direction to confirm it (default: 1)")
@@ -991,7 +1028,7 @@ def main() -> None:
                      help="Number of frames to analyze per direction (default: 5)")
     ap.add_argument("--no-draw", action="store_true")
     ap.add_argument("--no-save-keyframes", action="store_true")
-    ap.add_argument("--min-sharpness", type=float, default=50.0,
+    ap.add_argument("--min-sharpness", type=float, default=100.0,
                      help="Min Laplacian variance to accept a frame (0 = disabled, default: 50.0)")
     args = ap.parse_args()
 
